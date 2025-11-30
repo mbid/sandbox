@@ -1,6 +1,26 @@
 [package]
-name = "llm-sandbox"
+name = "sandbox"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
+[lib]
+name = "sandbox"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sandbox"
+path = "src/main.rs"
 
 [dependencies]
+anyhow = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+sha2 = "0.10"
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+notify = "6.1"
+tokio = { version = "1.35", features = ["full"] }
+dirs = "5.0"
+nix = { version = "0.27", features = ["user"] }
+chrono = { version = "0.4", features = ["serde"] }
+ctrlc = "3.4"
