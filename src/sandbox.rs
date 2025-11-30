@@ -213,17 +213,15 @@ pub fn run_sandbox(
         docker::remove_container(&info.container_name)?;
     }
 
-    // Set up overlay mounts for Claude config directories
+    // Set up overlay mounts
     let mut overlays: Vec<Overlay> = Vec::new();
 
-    if let Some(home) = dirs::home_dir() {
-        // Overlay for ~/.claude directory (copy-on-write)
-        let claude_dir = home.join(".claude");
-        if claude_dir.exists() {
-            let overlay = info.create_overlay("claude-dir", &claude_dir);
-            overlay.create_volume()?;
-            overlays.push(overlay);
-        }
+    // Overlay for target directory (Rust build artifacts, copy-on-write)
+    let target_dir = info.repo_root.join("target");
+    if target_dir.exists() {
+        let overlay = info.create_overlay("target-dir", &target_dir);
+        overlay.create_volume()?;
+        overlays.push(overlay);
     }
 
     // Copy single files (not directories) to sandbox directory
@@ -231,12 +229,13 @@ pub fn run_sandbox(
     let mut file_copies: Vec<(PathBuf, PathBuf)> = Vec::new();
 
     if let Some(home) = dirs::home_dir() {
-        // Copy ~/.claude.json (single file, not a directory)
+        // Copy ~/.claude.json with filtered projects (only keep the current project)
         let claude_json = home.join(".claude.json");
         if claude_json.exists() {
             let copy_path = info.sandbox_dir.join("claude.json");
-            std::fs::copy(&claude_json, &copy_path)
-                .with_context(|| format!("Failed to copy {}", claude_json.display()))?;
+            let filtered_json = filter_claude_json(&claude_json, &info.repo_root)?;
+            std::fs::write(&copy_path, filtered_json)
+                .with_context(|| format!("Failed to write filtered {}", copy_path.display()))?;
             file_copies.push((
                 copy_path,
                 PathBuf::from(format!("/home/{}/.claude.json", user_info.username)),
@@ -348,11 +347,10 @@ pub fn run_sandbox(
         }
     }
 
-    // Mount Claude config with overlay (copy-on-write, changes don't propagate out)
-    // Mount the overlay volume for ~/.claude directory
-    if let Some(claude_overlay) = overlays.iter().find(|o| o.name == "claude-dir") {
-        let target = PathBuf::from(format!("/home/{}/.claude", user_info.username));
-        args.extend(claude_overlay.docker_mount_args(&target));
+    // Mount target directory with overlay (copy-on-write, changes don't propagate out)
+    if let Some(target_overlay) = overlays.iter().find(|o| o.name == "target-dir") {
+        let target = info.repo_root.join("target");
+        args.extend(target_overlay.docker_mount_args(&target));
     }
 
     // Mount copied files (single files are copied, not overlaid)
@@ -431,4 +429,24 @@ pub fn ensure_sandbox(repo_root: &Path, name: &str) -> Result<SandboxInfo> {
     info.save()?;
 
     Ok(info)
+}
+
+/// Filter ~/.claude.json to only include the project matching repo_root.
+/// This preserves key ordering in the JSON using serde_json's preserve_order feature.
+fn filter_claude_json(claude_json_path: &Path, repo_root: &Path) -> Result<String> {
+    let contents = std::fs::read_to_string(claude_json_path)
+        .with_context(|| format!("Failed to read {}", claude_json_path.display()))?;
+
+    let mut json: serde_json::Value = serde_json::from_str(&contents)
+        .with_context(|| format!("Failed to parse {}", claude_json_path.display()))?;
+
+    // Filter the "projects" object to only keep the entry matching repo_root
+    if let Some(projects) = json.get_mut("projects") {
+        if let Some(projects_obj) = projects.as_object_mut() {
+            let repo_root_str = repo_root.to_string_lossy();
+            projects_obj.retain(|key, _| key == repo_root_str.as_ref());
+        }
+    }
+
+    serde_json::to_string_pretty(&json).context("Failed to serialize filtered JSON")
 }
