@@ -2,10 +2,6 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-/// Whitelisted network destinations for the sandbox.
-/// Claude API endpoint is allowed by default.
-pub const NETWORK_WHITELIST: &[&str] = &["api.anthropic.com", "claude.ai"];
-
 /// Get the cache directory for sandbox data.
 /// Uses $XDG_CACHE_HOME/sandbox or ~/.cache/sandbox as fallback.
 pub fn get_cache_dir() -> Result<PathBuf> {

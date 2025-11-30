@@ -7,7 +7,6 @@ use std::process::Command;
 use crate::config::{get_sandbox_base_dir, get_sandbox_instance_dir, UserInfo};
 use crate::docker;
 use crate::git;
-use crate::network;
 use crate::overlay::Overlay;
 
 /// Metadata about a sandbox instance.
@@ -245,9 +244,6 @@ pub fn run_sandbox(
         }
     }
 
-    // Ensure network exists for whitelist support
-    network::ensure_network()?;
-
     // Build docker run arguments
     let mut args = vec![
         "run".to_string(),
@@ -256,6 +252,9 @@ pub fn run_sandbox(
         info.container_name.clone(),
         "--label".to_string(),
         "sandbox=true".to_string(),
+        // Use gVisor for sandboxing
+        "--runtime".to_string(),
+        "runsc".to_string(),
         // User mapping
         "--user".to_string(),
         format!("{}:{}", user_info.uid, user_info.gid),
@@ -335,9 +334,6 @@ pub fn run_sandbox(
             ),
         ]);
     }
-
-    // Network: use sandbox network with whitelist
-    args.extend(network::get_network_args(true));
 
     // Add the image
     args.push(image_tag.to_string());
