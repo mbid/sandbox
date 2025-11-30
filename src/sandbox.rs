@@ -17,8 +17,9 @@ pub struct SandboxInfo {
     pub sandbox_dir: PathBuf,
     /// The actual clone directory (in cache)
     pub clone_dir: PathBuf,
-    /// Symlink that points to clone_dir, at repo_root location for path consistency
-    pub clone_symlink: PathBuf,
+    /// Symlink that points to repo_root, used as the source for shared clone
+    /// so the clone's alternates reference this path instead of repo_root directly
+    pub repo_symlink: PathBuf,
     pub container_name: String,
     pub created_at: String,
 }
@@ -28,14 +29,12 @@ impl SandboxInfo {
         let sandbox_dir = get_sandbox_instance_dir(repo_root, name)?;
         let clone_dir = sandbox_dir.join("clone");
 
-        // The symlink lives next to the repo_root so paths are consistent
-        // It will be at: /path/to/repo-sandbox-<name> -> clone_dir
-        let symlink_name = format!(
-            "{}-sandbox-{}",
-            repo_root.file_name().unwrap().to_string_lossy(),
-            name
-        );
-        let clone_symlink = repo_root.parent().unwrap().join(&symlink_name);
+        // The repo symlink lives in the sandbox cache dir and points to repo_root.
+        // We create the shared clone from this symlink so the clone's alternates
+        // reference the symlink path. This allows the clone to work both:
+        // - Outside the container: symlink resolves to repo_root
+        // - Inside the container: repo is mounted at the symlink path
+        let repo_symlink = sandbox_dir.join("repo");
 
         let container_name = format!(
             "sandbox-{}-{}",
@@ -49,7 +48,7 @@ impl SandboxInfo {
             repo_root: repo_root.to_path_buf(),
             sandbox_dir,
             clone_dir,
-            clone_symlink,
+            repo_symlink,
             container_name,
             created_at,
         })
@@ -139,8 +138,8 @@ pub fn delete_sandbox(info: &SandboxInfo) -> Result<()> {
         .status();
 
     // Remove symlink
-    if info.clone_symlink.exists() || info.clone_symlink.is_symlink() {
-        let _ = std::fs::remove_file(&info.clone_symlink);
+    if info.repo_symlink.exists() || info.repo_symlink.is_symlink() {
+        let _ = std::fs::remove_file(&info.repo_symlink);
     }
 
     // Remove sandbox directory
@@ -229,26 +228,26 @@ pub fn run_sandbox(
         format!("{}:{}", user_info.uid, user_info.gid),
     ];
 
-    // Mount the original repo as read-only for shared clone to work
-    // The repo is mounted at the same path inside the container
+    // Mount the original repo at the symlink path (read-only)
+    // The shared clone's alternates reference the symlink path, so we mount the repo there.
+    // This makes the clone work inside the container.
     args.extend([
         "--mount".to_string(),
         format!(
             "type=bind,source={},target={},readonly",
             info.repo_root.display(),
-            info.repo_root.display()
+            info.repo_symlink.display()
         ),
     ]);
 
-    // Mount the sandbox clone directory at the symlink path
-    // Inside the container, the path will be the same as the symlink path externally
-    // This makes paths consistent between host and container
+    // Mount the sandbox clone at the original repo path
+    // This way the working directory path matches the original repo path
     args.extend([
         "--mount".to_string(),
         format!(
             "type=bind,source={},target={}",
             info.clone_dir.display(),
-            info.clone_symlink.display()
+            info.repo_root.display()
         ),
     ]);
 
@@ -262,10 +261,10 @@ pub fn run_sandbox(
         ),
     ]);
 
-    // Set working directory to the symlink path (same as external view)
+    // Set working directory to the repo path (where clone is mounted)
     args.extend([
         "--workdir".to_string(),
-        info.clone_symlink.to_string_lossy().to_string(),
+        info.repo_root.to_string_lossy().to_string(),
     ]);
 
     // Mount fish config if user uses fish
@@ -354,19 +353,24 @@ pub fn ensure_sandbox(repo_root: &Path, name: &str) -> Result<SandboxInfo> {
     // Create sandbox directory
     std::fs::create_dir_all(&info.sandbox_dir)?;
 
-    // Create shared clone if it doesn't exist
-    git::create_shared_clone(repo_root, &info.clone_dir)?;
-
-    // Create symlink if it doesn't exist
-    if !info.clone_symlink.exists() && !info.clone_symlink.is_symlink() {
-        symlink(&info.clone_dir, &info.clone_symlink).with_context(|| {
+    // Create symlink to repo first (if it doesn't exist)
+    // This symlink points to repo_root and will be used as the source for the shared clone.
+    // This way, the clone's alternates reference the symlink path, making it work both:
+    // - Outside the container: symlink resolves to the real repo
+    // - Inside the container: repo is mounted at the symlink path
+    if !info.repo_symlink.exists() && !info.repo_symlink.is_symlink() {
+        symlink(&info.repo_root, &info.repo_symlink).with_context(|| {
             format!(
                 "Failed to create symlink {} -> {}",
-                info.clone_symlink.display(),
-                info.clone_dir.display()
+                info.repo_symlink.display(),
+                info.repo_root.display()
             )
         })?;
     }
+
+    // Create shared clone from the symlink path (not the real repo path)
+    // This ensures the clone references the symlink in its alternates
+    git::create_shared_clone(&info.repo_symlink, &info.clone_dir)?;
 
     // Setup bidirectional remotes
     git::setup_bidirectional_remotes(repo_root, &info.clone_dir, name)?;
