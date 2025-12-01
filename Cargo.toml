@@ -23,4 +23,3 @@ tokio = { version = "1.35", features = ["full"] }
 dirs = "5.0"
 nix = { version = "0.27", features = ["user"] }
 chrono = { version = "0.4", features = ["serde"] }
-ctrlc = "3.4"

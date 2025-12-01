@@ -294,33 +294,6 @@ pub fn delete_sandbox(info: &SandboxInfo) -> Result<()> {
     Ok(())
 }
 
-/// Clean up orphaned Docker volumes (volumes without corresponding sandbox directories).
-pub fn cleanup_orphaned_volumes(repo_root: &Path) -> Result<()> {
-    let prefix = format!(
-        "sandbox-{}-",
-        repo_root.file_name().unwrap().to_string_lossy()
-    );
-
-    let volumes = docker::list_volumes_with_prefix(&prefix)?;
-    let sandboxes = list_sandboxes(repo_root)?;
-    let sandbox_names: Vec<_> = sandboxes.iter().map(|s| &s.name).collect();
-
-    for volume in volumes {
-        // Extract sandbox name from volume name
-        // Format: sandbox-<repo>-<name>-<purpose>
-        let parts: Vec<_> = volume.split('-').collect();
-        if parts.len() >= 3 {
-            let sandbox_name = parts[2];
-            if !sandbox_names.iter().any(|n| *n == sandbox_name) {
-                eprintln!("Removing orphaned volume: {}", volume);
-                let _ = docker::remove_volume(&volume);
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Build the list of mounts for a sandbox container.
 fn build_mount_list(info: &SandboxInfo, user_info: &UserInfo) -> Vec<Mount> {
     let home = dirs::home_dir();

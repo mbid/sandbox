@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::config::UserInfo;
 use crate::docker;
 use crate::git;
-use crate::sandbox::{self, SandboxInfo};
+use crate::sandbox;
 use crate::sync;
 
 #[derive(Parser)]
@@ -30,27 +30,12 @@ pub enum Commands {
         command: Vec<String>,
     },
 
-    /// Attach to an existing running sandbox
-    Attach {
-        /// Name of the sandbox to attach to
-        name: String,
-    },
-
     /// List all sandboxes for the current repository
     List,
 
     /// Delete a sandbox
     Delete {
         /// Name of the sandbox to delete
-        name: String,
-    },
-
-    /// Clean up orphaned Docker volumes
-    Cleanup,
-
-    /// Start git sync watcher for a sandbox (runs in foreground)
-    Sync {
-        /// Name of the sandbox to sync
         name: String,
     },
 }
@@ -66,20 +51,11 @@ pub fn run() -> Result<()> {
         Commands::Run { name, command } => {
             run_sandbox(&repo_root, &name, &user_info, command)?;
         }
-        Commands::Attach { name } => {
-            attach_sandbox(&repo_root, &name, &user_info)?;
-        }
         Commands::List => {
             list_sandboxes(&repo_root)?;
         }
         Commands::Delete { name } => {
             delete_sandbox(&repo_root, &name)?;
-        }
-        Commands::Cleanup => {
-            cleanup(&repo_root)?;
-        }
-        Commands::Sync { name } => {
-            run_sync(&repo_root, &name)?;
         }
     }
 
@@ -135,28 +111,6 @@ fn run_sandbox(
     result
 }
 
-fn attach_sandbox(repo_root: &PathBuf, name: &str, user_info: &UserInfo) -> Result<()> {
-    let info = SandboxInfo::new(name, repo_root)?;
-
-    if !docker::container_is_running(&info.container_name)? {
-        bail!(
-            "Sandbox '{}' is not running. Use 'sandbox run {}' to start it.",
-            name,
-            name
-        );
-    }
-
-    let shell = if user_info.uses_fish() {
-        "fish"
-    } else {
-        "bash"
-    };
-
-    docker::attach_container(&info.container_name, shell)?;
-
-    Ok(())
-}
-
 fn list_sandboxes(repo_root: &PathBuf) -> Result<()> {
     let sandboxes = sandbox::list_sandboxes(repo_root)?;
 
@@ -193,40 +147,6 @@ fn delete_sandbox(repo_root: &PathBuf, name: &str) -> Result<()> {
 
     sandbox::delete_sandbox(&info)?;
     println!("Deleted sandbox: {}", name);
-
-    Ok(())
-}
-
-fn cleanup(repo_root: &PathBuf) -> Result<()> {
-    sandbox::cleanup_orphaned_volumes(repo_root)?;
-    println!("Cleanup complete.");
-    Ok(())
-}
-
-fn run_sync(repo_root: &PathBuf, name: &str) -> Result<()> {
-    let info = SandboxInfo::new(name, repo_root)?;
-
-    if !info.clone_dir.exists() {
-        bail!("Sandbox '{}' not found or not set up", name);
-    }
-
-    eprintln!(
-        "Starting git sync watcher between {} and {}",
-        repo_root.display(),
-        info.clone_dir.display()
-    );
-    eprintln!("Press Ctrl+C to stop");
-
-    let running = Arc::new(AtomicBool::new(true));
-    let running_clone = running.clone();
-
-    // Handle Ctrl+C
-    ctrlc::set_handler(move || {
-        running_clone.store(false, Ordering::SeqCst);
-    })
-    .expect("Error setting Ctrl-C handler");
-
-    sync::run_sync_loop(repo_root, &info.clone_dir, &running)?;
 
     Ok(())
 }
