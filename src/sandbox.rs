@@ -5,7 +5,9 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::config::{get_sandbox_base_dir, get_sandbox_instance_dir, Runtime, UserInfo};
+use crate::config::{
+    get_sandbox_base_dir, get_sandbox_instance_dir, OverlayMode, Runtime, UserInfo,
+};
 use crate::docker;
 use crate::git;
 use crate::overlay::Overlay;
@@ -75,7 +77,11 @@ impl Mount {
 }
 
 /// Process mounts and generate docker arguments.
-fn process_mounts(mounts: &[Mount], info: &SandboxInfo, runtime: Runtime) -> Result<Vec<String>> {
+fn process_mounts(
+    mounts: &[Mount],
+    info: &SandboxInfo,
+    overlay_mode: OverlayMode,
+) -> Result<Vec<String>> {
     let mut docker_args = Vec::new();
 
     for mount in mounts {
@@ -110,38 +116,39 @@ fn process_mounts(mounts: &[Mount], info: &SandboxInfo, runtime: Runtime) -> Res
             MountMode::Overlay => {
                 let name = mount.unique_name();
                 if mount.host_path.is_dir() {
-                    // Sysbox doesn't support overlayfs properly due to its shiftfs/ID-mapped
-                    // mounts implementation. Instead, we copy the directory and bind mount it.
-                    // See: https://github.com/nestybox/sysbox/issues/968
-                    if matches!(runtime, Runtime::SysboxRunc) {
-                        let copy_dir = info.overlays_dir().join(&name).join("copy");
-                        if !copy_dir.exists() {
-                            let mut options = fs_extra::dir::CopyOptions::new();
-                            options.copy_inside = true;
-                            options.content_only = true;
-                            std::fs::create_dir_all(&copy_dir)?;
-                            fs_extra::dir::copy(&mount.host_path, &copy_dir, &options)
-                                .with_context(|| {
-                                    format!(
-                                        "Failed to copy directory {} to {}",
-                                        mount.host_path.display(),
-                                        copy_dir.display()
-                                    )
-                                })?;
+                    match overlay_mode {
+                        OverlayMode::Copy => {
+                            // Eagerly copy the directory and bind mount it
+                            let copy_dir = info.overlays_dir().join(&name).join("copy");
+                            if !copy_dir.exists() {
+                                let mut options = fs_extra::dir::CopyOptions::new();
+                                options.copy_inside = true;
+                                options.content_only = true;
+                                std::fs::create_dir_all(&copy_dir)?;
+                                fs_extra::dir::copy(&mount.host_path, &copy_dir, &options)
+                                    .with_context(|| {
+                                        format!(
+                                            "Failed to copy directory {} to {}",
+                                            mount.host_path.display(),
+                                            copy_dir.display()
+                                        )
+                                    })?;
+                            }
+                            docker_args.extend([
+                                "--mount".to_string(),
+                                format!(
+                                    "type=bind,source={},target={}",
+                                    copy_dir.display(),
+                                    target.display()
+                                ),
+                            ]);
                         }
-                        docker_args.extend([
-                            "--mount".to_string(),
-                            format!(
-                                "type=bind,source={},target={}",
-                                copy_dir.display(),
-                                target.display()
-                            ),
-                        ]);
-                    } else {
-                        // Use overlayfs for directories (default for non-sysbox runtimes)
-                        let overlay = info.create_overlay(&name, &mount.host_path);
-                        overlay.create_volume()?;
-                        docker_args.extend(overlay.docker_mount_args(&target));
+                        OverlayMode::Overlayfs => {
+                            // Use overlayfs for directories
+                            let overlay = info.create_overlay(&name, &mount.host_path);
+                            overlay.create_volume()?;
+                            docker_args.extend(overlay.docker_mount_args(&target));
+                        }
                     }
                 } else {
                     // Copy file to sandbox directory and bind mount it
@@ -450,10 +457,20 @@ pub fn run_sandbox(
     image_tag: &str,
     user_info: &UserInfo,
     runtime: Runtime,
+    overlay_mode: OverlayMode,
     command: Option<&[String]>,
 ) -> Result<()> {
+    // Warn about overlayfs + sysbox combination
+    if matches!(runtime, Runtime::SysboxRunc) && matches!(overlay_mode, OverlayMode::Overlayfs) {
+        eprintln!(
+            "Warning: Using overlayfs with sysbox-runc may cause permission issues.\n\
+             Consider using --overlay-mode copy instead.\n\
+             See: https://github.com/nestybox/sysbox/issues/968"
+        );
+    }
+
     // Ensure container is running
-    let launched = ensure_container_running(info, image_tag, user_info, runtime)?;
+    let launched = ensure_container_running(info, image_tag, user_info, runtime, overlay_mode)?;
 
     // If we launched a new container, spawn the sync daemon
     if launched {
@@ -500,6 +517,7 @@ fn ensure_container_running(
     image_tag: &str,
     user_info: &UserInfo,
     runtime: Runtime,
+    overlay_mode: OverlayMode,
 ) -> Result<bool> {
     // If already running, we're done
     if docker::container_is_running(&info.container_name)? {
@@ -535,7 +553,7 @@ fn ensure_container_running(
 
     // Build and process the mount list
     let mounts = build_mount_list(info, user_info);
-    args.extend(process_mounts(&mounts, info, runtime)?);
+    args.extend(process_mounts(&mounts, info, overlay_mode)?);
 
     // Special handling for ~/.claude.json (needs filtering, not just copying)
     if let Some(home) = dirs::home_dir() {

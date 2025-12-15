@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use crate::config::{Runtime, UserInfo};
+use crate::config::{OverlayMode, Runtime, UserInfo};
 use crate::docker;
 use crate::git;
 use crate::sandbox;
@@ -26,6 +26,11 @@ pub enum Commands {
         /// Container runtime to use for sandboxing
         #[arg(short, long, value_enum, default_value_t = Runtime::Runsc)]
         runtime: Runtime,
+
+        /// Strategy for copy-on-write mounts (directories that are writable inside the
+        /// container but don't propagate changes to the host)
+        #[arg(short, long, value_enum, default_value_t = OverlayMode::Overlayfs)]
+        overlay_mode: OverlayMode,
 
         /// Command to run inside the sandbox (default: interactive shell)
         #[arg(last = true)]
@@ -67,9 +72,17 @@ pub fn run() -> Result<()> {
                 Commands::Enter {
                     name,
                     runtime,
+                    overlay_mode,
                     command,
                 } => {
-                    run_sandbox(&repo_root, &name, &user_info, runtime, command)?;
+                    run_sandbox(
+                        &repo_root,
+                        &name,
+                        &user_info,
+                        runtime,
+                        overlay_mode,
+                        command,
+                    )?;
                 }
                 Commands::List => {
                     list_sandboxes(&repo_root)?;
@@ -90,6 +103,7 @@ fn run_sandbox(
     name: &str,
     user_info: &UserInfo,
     runtime: Runtime,
+    overlay_mode: OverlayMode,
     command: Vec<String>,
 ) -> Result<()> {
     // Check for Dockerfile
@@ -114,7 +128,7 @@ fn run_sandbox(
         Some(command.as_slice())
     };
 
-    let result = sandbox::run_sandbox(&info, &image_tag, user_info, runtime, cmd);
+    let result = sandbox::run_sandbox(&info, &image_tag, user_info, runtime, overlay_mode, cmd);
 
     result
 }

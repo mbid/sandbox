@@ -15,6 +15,16 @@ pub enum Runtime {
     SysboxRunc,
 }
 
+/// Strategy for copy-on-write mounts (writes inside container don't propagate to host).
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum OverlayMode {
+    /// Use overlayfs (default) - efficient but may have permission issues with sysbox
+    #[default]
+    Overlayfs,
+    /// Eagerly copy the directory - works with all runtimes but uses more disk space
+    Copy,
+}
+
 impl Runtime {
     /// Get the runtime name as used by Docker's --runtime flag.
     pub fn docker_runtime_name(&self) -> &'static str {
