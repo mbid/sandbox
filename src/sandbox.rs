@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use reflink_copy::reflink_or_copy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -77,6 +78,36 @@ impl Mount {
     }
 }
 
+/// Recursively copy a directory using reflink_or_copy for files.
+/// This leverages copy-on-write on filesystems that support it (like btrfs).
+fn copy_dir_reflink(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let file_type = entry.file_type()?;
+
+        if file_type.is_dir() {
+            copy_dir_reflink(&src_path, &dst_path)?;
+        } else if file_type.is_symlink() {
+            let target = std::fs::read_link(&src_path)?;
+            std::os::unix::fs::symlink(&target, &dst_path)?;
+        } else {
+            reflink_or_copy(&src_path, &dst_path).with_context(|| {
+                format!(
+                    "Failed to copy {} to {}",
+                    src_path.display(),
+                    dst_path.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Process mounts and generate docker arguments.
 fn process_mounts(
     mounts: &[Mount],
@@ -122,18 +153,15 @@ fn process_mounts(
                             // Eagerly copy the directory and bind mount it
                             let copy_dir = info.overlays_dir().join(&name).join("copy");
                             if !copy_dir.exists() {
-                                let mut options = fs_extra::dir::CopyOptions::new();
-                                options.copy_inside = true;
-                                options.content_only = true;
-                                std::fs::create_dir_all(&copy_dir)?;
-                                fs_extra::dir::copy(&mount.host_path, &copy_dir, &options)
-                                    .with_context(|| {
+                                copy_dir_reflink(&mount.host_path, &copy_dir).with_context(
+                                    || {
                                         format!(
                                             "Failed to copy directory {} to {}",
                                             mount.host_path.display(),
                                             copy_dir.display()
                                         )
-                                    })?;
+                                    },
+                                )?;
                             }
                             docker_args.extend([
                                 "--mount".to_string(),
@@ -154,7 +182,7 @@ fn process_mounts(
                 } else {
                     // Copy file to sandbox directory and bind mount it
                     let copy_path = info.sandbox_dir.join(&name);
-                    std::fs::copy(&mount.host_path, &copy_path).with_context(|| {
+                    reflink_or_copy(&mount.host_path, &copy_path).with_context(|| {
                         format!(
                             "Failed to copy {} to {}",
                             mount.host_path.display(),
