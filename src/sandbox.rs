@@ -1,7 +1,8 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::os::unix::fs::symlink;
+use std::collections::HashSet;
+use std::os::unix::fs::{symlink, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -174,6 +175,102 @@ fn process_mounts(
     }
 
     Ok(docker_args)
+}
+
+/// Fix ownership of mount parent directories inside the container.
+///
+/// When Docker creates parent directories for bind mounts, they're owned by root.
+/// This function fixes ownership to match the host: for each mount target's parent
+/// directories, if the corresponding host parent is owned by the user, we chown
+/// the container parent to the user (if it was created by Docker, i.e., owned by root).
+fn fix_mount_parent_ownership(
+    container_name: &str,
+    mounts: &[Mount],
+    user_info: &UserInfo,
+) -> Result<()> {
+    // Collect all (host_parent, container_parent) pairs by walking up both paths in parallel
+    let mut container_parents_to_fix: HashSet<PathBuf> = HashSet::new();
+
+    for mount in mounts {
+        if !mount.host_path.exists() {
+            continue;
+        }
+
+        let mut host_path = mount.host_path.clone();
+        let mut container_path = mount.target_path().to_path_buf();
+
+        loop {
+            let Some(host_parent) = host_path.parent() else {
+                break;
+            };
+            let Some(container_parent) = container_path.parent() else {
+                break;
+            };
+
+            // Stop at root
+            if host_parent.as_os_str().is_empty() || container_parent.as_os_str().is_empty() {
+                break;
+            }
+
+            // Check if host parent is owned by the user
+            if let Ok(meta) = std::fs::metadata(host_parent) {
+                if meta.uid() == user_info.uid {
+                    container_parents_to_fix.insert(container_parent.to_path_buf());
+                }
+            }
+
+            host_path = host_parent.to_path_buf();
+            container_path = container_parent.to_path_buf();
+        }
+    }
+
+    if container_parents_to_fix.is_empty() {
+        return Ok(());
+    }
+
+    // Build a shell script that checks each directory and chowns if owned by root
+    let paths: Vec<_> = container_parents_to_fix
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+
+    // Use a heredoc-style approach to safely pass paths
+    let script = format!(
+        r#"for p in {}; do
+            if [ -d "$p" ] && [ "$(stat -c '%u' "$p")" = "0" ]; then
+                chown {}:{} "$p"
+            fi
+        done"#,
+        paths
+            .iter()
+            .map(|p| format!("'{}'", p.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" "),
+        user_info.uid,
+        user_info.gid
+    );
+
+    let status = Command::new("docker")
+        .args([
+            "exec",
+            "--user",
+            "root",
+            container_name,
+            "sh",
+            "-c",
+            &script,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("Failed to fix mount parent ownership")?;
+
+    if !status.success() {
+        // Non-fatal: log but continue
+        eprintln!("Warning: Failed to fix some mount parent directory ownership");
+    }
+
+    Ok(())
 }
 
 /// Metadata about a sandbox instance.
@@ -591,6 +688,9 @@ fn ensure_container_running(
     if !status.success() {
         bail!("Failed to start container");
     }
+
+    // Fix ownership of mount parent directories that Docker created as root
+    fix_mount_parent_ownership(&info.container_name, &mounts, user_info)?;
 
     Ok(true)
 }
