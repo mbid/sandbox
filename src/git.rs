@@ -148,3 +148,185 @@ pub fn fetch_branch(repo: &Path, remote: &str, branch: &str) -> Result<()> {
 
     Ok(())
 }
+
+/// Ensure the meta.git bare repository exists.
+/// Creates a bare clone of the host repo if it doesn't exist.
+/// Returns true if a new meta.git was created, false if it already existed.
+pub fn ensure_meta_git(host_repo: &Path, meta_git_dir: &Path) -> Result<bool> {
+    if meta_git_dir.exists() {
+        return Ok(false);
+    }
+
+    // Create parent directory if needed
+    if let Some(parent) = meta_git_dir.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+    }
+
+    eprintln!(
+        "Creating meta.git bare clone: {} -> {}",
+        host_repo.display(),
+        meta_git_dir.display()
+    );
+
+    let status = Command::new("git")
+        .args([
+            "clone",
+            "--bare",
+            &host_repo.to_string_lossy(),
+            &meta_git_dir.to_string_lossy(),
+        ])
+        .status()
+        .context("Failed to run git clone --bare")?;
+
+    if !status.success() {
+        bail!("Git bare clone failed");
+    }
+
+    // Sync main branch from host to ensure it's up to date
+    sync_main_to_meta(host_repo, meta_git_dir)?;
+
+    Ok(true)
+}
+
+/// Get the primary branch name (main or master) of a repository.
+fn get_primary_branch(repo: &Path) -> Result<String> {
+    // Try to get the default branch from HEAD
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .output()
+        .context("Failed to get HEAD branch")?;
+
+    if output.status.success() {
+        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !branch.is_empty() {
+            return Ok(branch);
+        }
+    }
+
+    // Fallback: check if main exists, otherwise use master
+    let status = Command::new("git")
+        .current_dir(repo)
+        .args(["show-ref", "--verify", "--quiet", "refs/heads/main"])
+        .status()
+        .context("Failed to check for main branch")?;
+
+    if status.success() {
+        Ok("main".to_string())
+    } else {
+        Ok("master".to_string())
+    }
+}
+
+/// Sync the primary branch (main/master) from host repo to meta.git.
+/// This is a ONE-WAY sync: host -> meta only.
+pub fn sync_main_to_meta(host_repo: &Path, meta_git_dir: &Path) -> Result<()> {
+    let branch = get_primary_branch(host_repo)?;
+
+    // Fetch the branch from host into meta.git
+    let status = Command::new("git")
+        .current_dir(meta_git_dir)
+        .args([
+            "fetch",
+            &host_repo.to_string_lossy(),
+            &format!("{}:refs/heads/{}", branch, branch),
+        ])
+        .status()
+        .context("Failed to fetch main branch to meta.git")?;
+
+    if !status.success() {
+        bail!("Failed to sync {} branch to meta.git", branch);
+    }
+
+    Ok(())
+}
+
+/// Sync a sandbox branch from the sandbox repo to meta.git.
+pub fn sync_sandbox_to_meta(meta_git_dir: &Path, sandbox_repo: &Path, branch: &str) -> Result<()> {
+    let status = Command::new("git")
+        .current_dir(meta_git_dir)
+        .args([
+            "fetch",
+            &sandbox_repo.to_string_lossy(),
+            &format!("{}:refs/heads/{}", branch, branch),
+        ])
+        .status()
+        .context("Failed to sync sandbox branch to meta.git")?;
+
+    if !status.success() {
+        bail!("Failed to sync branch {} to meta.git", branch);
+    }
+
+    Ok(())
+}
+
+/// Sync a branch from meta.git to the host repo's remote tracking refs.
+/// Updates refs/remotes/sandbox/<branch> in the host repo.
+pub fn sync_meta_to_host(host_repo: &Path, meta_git_dir: &Path, branch: &str) -> Result<()> {
+    // Fetch the specific branch from meta.git and update the remote tracking ref
+    let status = Command::new("git")
+        .current_dir(host_repo)
+        .args([
+            "fetch",
+            &meta_git_dir.to_string_lossy(),
+            &format!("refs/heads/{}:refs/remotes/sandbox/{}", branch, branch),
+        ])
+        .status()
+        .context("Failed to sync meta.git branch to host")?;
+
+    if !status.success() {
+        bail!("Failed to sync branch {} from meta.git to host", branch);
+    }
+
+    Ok(())
+}
+
+/// Setup the "sandbox" remote in the host repo pointing to meta.git.
+pub fn setup_host_sandbox_remote(host_repo: &Path, meta_git_dir: &Path) -> Result<()> {
+    add_remote(host_repo, "sandbox", meta_git_dir)
+}
+
+/// Setup remotes for a sandbox repo.
+/// Renames the "origin" remote (created by git clone) to "sandbox".
+pub fn setup_sandbox_remotes(meta_git_dir: &Path, sandbox_repo: &Path) -> Result<()> {
+    // Rename "origin" (created by git clone --shared) to "sandbox"
+    let status = Command::new("git")
+        .current_dir(sandbox_repo)
+        .args(["remote", "rename", "origin", "sandbox"])
+        .status()
+        .context("Failed to rename origin remote to sandbox")?;
+
+    if !status.success() {
+        bail!("Failed to rename origin remote to sandbox");
+    }
+
+    // Update the URL to ensure it points to meta_git_dir
+    let status = Command::new("git")
+        .current_dir(sandbox_repo)
+        .args([
+            "remote",
+            "set-url",
+            "sandbox",
+            &meta_git_dir.to_string_lossy(),
+        ])
+        .status()
+        .context("Failed to set sandbox remote URL")?;
+
+    if !status.success() {
+        bail!("Failed to set sandbox remote URL");
+    }
+
+    // Allow fetching arbitrary SHAs (useful for syncing specific commits)
+    let status = Command::new("git")
+        .current_dir(sandbox_repo)
+        .args(["config", "uploadpack.allowAnySHA1InWant", "true"])
+        .status()
+        .context("Failed to configure uploadpack.allowAnySHA1InWant")?;
+
+    if !status.success() {
+        bail!("Failed to configure sandbox repo");
+    }
+
+    Ok(())
+}

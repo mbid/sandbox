@@ -9,8 +9,13 @@ use crate::docker;
 use crate::git;
 use crate::sandbox::SandboxInfo;
 
-/// Run the sync daemon, watching for changes in the sandbox clone and fetching
-/// them into the host repo. Exits when the container stops.
+/// Run the sync daemon, watching for changes in the sandbox clone and syncing
+/// through meta.git to the host repo. Also periodically syncs main branch from
+/// host to meta.git. Exits when the container stops.
+///
+/// Sync flow:
+/// - Sandbox changes: sandbox -> meta.git -> host (refs/remotes/sandbox/<branch>)
+/// - Main branch: host -> meta.git (one-way, periodic)
 ///
 /// Errors are logged to `sandbox_dir/sync.log`.
 pub fn run_sync_daemon(info: &SandboxInfo) -> Result<()> {
@@ -20,8 +25,6 @@ pub fn run_sync_daemon(info: &SandboxInfo) -> Result<()> {
         .append(true)
         .open(&log_path)
         .with_context(|| format!("Failed to open log file: {}", log_path.display()))?;
-
-    let remote_name = format!("sandbox-{}", info.name);
 
     log(
         &mut log_file,
@@ -33,11 +36,7 @@ pub fn run_sync_daemon(info: &SandboxInfo) -> Result<()> {
     );
     log(
         &mut log_file,
-        &format!(
-            "Fetching to: {} remote '{}'",
-            info.repo_root.display(),
-            remote_name
-        ),
+        &format!("Syncing via meta.git: {}", info.meta_git_dir.display()),
     );
 
     let (tx, rx) = mpsc::channel();
@@ -68,8 +67,10 @@ pub fn run_sync_daemon(info: &SandboxInfo) -> Result<()> {
 
     let debounce = Duration::from_millis(500);
     let container_check_interval = Duration::from_secs(5);
+    let main_sync_interval = Duration::from_secs(30);
     let mut last_sync = Instant::now();
     let mut last_container_check = Instant::now();
+    let mut last_main_sync = Instant::now();
     let mut pending_sync = false;
 
     loop {
@@ -96,12 +97,44 @@ pub fn run_sync_daemon(info: &SandboxInfo) -> Result<()> {
         let now = Instant::now();
 
         // Perform sync if we have pending changes and debounce period has passed
+        // Sync flow: sandbox -> meta.git -> host
         if pending_sync && now.duration_since(last_sync) > debounce {
-            if let Err(e) = git::fetch_branch(&info.repo_root, &remote_name, &info.name) {
-                log(&mut log_file, &format!("Fetch error: {}", e));
+            // Step 1: Sync sandbox branch to meta.git
+            if let Err(e) =
+                git::sync_sandbox_to_meta(&info.meta_git_dir, &info.clone_dir, &info.name)
+            {
+                log(
+                    &mut log_file,
+                    &format!("Error syncing sandbox to meta.git: {}", e),
+                );
+            } else {
+                // Step 2: Sync meta.git to host remote tracking ref
+                if let Err(e) =
+                    git::sync_meta_to_host(&info.repo_root, &info.meta_git_dir, &info.name)
+                {
+                    log(
+                        &mut log_file,
+                        &format!("Error syncing meta.git to host: {}", e),
+                    );
+                }
             }
             last_sync = now;
             pending_sync = false;
+        }
+
+        // Periodically sync main branch from host to meta.git (one-way)
+        if now.duration_since(last_main_sync) > main_sync_interval {
+            // TODO: At the moment, we're launching one sync loop for every sandbox, meaning that
+            // we're executing the main-to-meta sync once for every existing sandbox. This is
+            // wasteful (although probably still correct), we should only be doing to that once.
+
+            if let Err(e) = git::sync_main_to_meta(&info.repo_root, &info.meta_git_dir) {
+                log(
+                    &mut log_file,
+                    &format!("Error syncing main branch to meta.git: {}", e),
+                );
+            }
+            last_main_sync = now;
         }
 
         // Periodically check if container is still running

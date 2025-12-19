@@ -3,12 +3,13 @@ use reflink_copy::reflink_or_copy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::os::unix::fs::{symlink, MetadataExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::config::{
-    get_sandbox_base_dir, get_sandbox_instance_dir, OverlayMode, Runtime, UserInfo,
+    get_meta_git_dir, get_sandbox_base_dir, get_sandbox_instance_dir, OverlayMode, Runtime,
+    UserInfo,
 };
 use crate::docker;
 use crate::git;
@@ -309,9 +310,8 @@ pub struct SandboxInfo {
     pub sandbox_dir: PathBuf,
     /// The actual clone directory (in cache)
     pub clone_dir: PathBuf,
-    /// Symlink that points to repo_root, used as the source for shared clone
-    /// so the clone's alternates reference this path instead of repo_root directly
-    pub repo_symlink: PathBuf,
+    /// Path to the shared meta.git bare repository
+    pub meta_git_dir: PathBuf,
     /// Directory for PID files tracking attached processes
     pub pids_dir: PathBuf,
     pub container_name: String,
@@ -323,13 +323,7 @@ impl SandboxInfo {
         let sandbox_dir = get_sandbox_instance_dir(repo_root, name)?;
         let clone_dir = sandbox_dir.join("clone");
         let pids_dir = sandbox_dir.join("pids");
-
-        // The repo symlink lives in the sandbox cache dir and points to repo_root.
-        // We create the shared clone from this symlink so the clone's alternates
-        // reference the symlink path. This allows the clone to work both:
-        // - Outside the container: symlink resolves to repo_root
-        // - Inside the container: repo is mounted at the symlink path
-        let repo_symlink = sandbox_dir.join("repo");
+        let meta_git_dir = get_meta_git_dir(repo_root)?;
 
         let container_name = format!(
             "sandbox-{}-{}",
@@ -343,7 +337,7 @@ impl SandboxInfo {
             repo_root: repo_root.to_path_buf(),
             sandbox_dir,
             clone_dir,
-            repo_symlink,
+            meta_git_dir,
             pids_dir,
             container_name,
             created_at,
@@ -513,22 +507,48 @@ pub fn delete_sandbox(info: &SandboxInfo) -> Result<()> {
         }
     }
 
-    // Remove the remote from main repo
-    let remote_name = format!("sandbox-{}", info.name);
+    // Remove sandbox branch from meta.git
+    if info.meta_git_dir.exists() {
+        let _ = Command::new("git")
+            .current_dir(&info.meta_git_dir)
+            .args(["branch", "-D", &info.name])
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    // Remove remote tracking ref from host repo
     let _ = Command::new("git")
         .current_dir(&info.repo_root)
-        .args(["remote", "remove", &remote_name])
+        .args([
+            "update-ref",
+            "-d",
+            &format!("refs/remotes/sandbox/{}", info.name),
+        ])
         .status();
-
-    // Remove symlink
-    if info.repo_symlink.exists() || info.repo_symlink.is_symlink() {
-        let _ = std::fs::remove_file(&info.repo_symlink);
-    }
 
     // Remove sandbox directory (includes overlay upper/work dirs)
     if info.sandbox_dir.exists() {
         std::fs::remove_dir_all(&info.sandbox_dir)
             .with_context(|| format!("Failed to remove: {}", info.sandbox_dir.display()))?;
+    }
+
+    // Check if this was the last sandbox for this repo
+    // If so, clean up meta.git and the sandbox remote
+    let remaining_sandboxes = list_sandboxes(&info.repo_root)?;
+    if remaining_sandboxes.is_empty() {
+        eprintln!("Last sandbox deleted, cleaning up meta.git...");
+
+        // Remove meta.git
+        if info.meta_git_dir.exists() {
+            std::fs::remove_dir_all(&info.meta_git_dir)
+                .with_context(|| format!("Failed to remove: {}", info.meta_git_dir.display()))?;
+        }
+
+        // Remove sandbox remote from host repo
+        let _ = Command::new("git")
+            .current_dir(&info.repo_root)
+            .args(["remote", "remove", "sandbox"])
+            .status();
     }
 
     Ok(())
@@ -541,8 +561,9 @@ fn build_mount_list(info: &SandboxInfo, user_info: &UserInfo) -> Vec<Mount> {
 
     // Core mounts for the repository setup
     let mut mounts = vec![
-        // Original repo at symlink path (read-only, for git alternates)
-        Mount::new(&info.repo_root, MountMode::ReadOnly).with_container_path(&info.repo_symlink),
+        // meta.git at its actual path (read-only, for git alternates and sandbox remote)
+        // The sandbox clone's alternates reference this path
+        Mount::new(&info.meta_git_dir, MountMode::ReadOnly),
         // Sandbox clone at the original repo path (write-through for working directory)
         Mount::new(&info.clone_dir, MountMode::WriteThrough).with_container_path(&info.repo_root),
         // Sandbox clone at its actual path (write-through for git operations)
@@ -730,31 +751,26 @@ pub fn ensure_sandbox(repo_root: &Path, name: &str) -> Result<SandboxInfo> {
     // Create sandbox directory
     std::fs::create_dir_all(&info.sandbox_dir)?;
 
-    // Create symlink to repo first (if it doesn't exist)
-    // This symlink points to repo_root and will be used as the source for the shared clone.
-    // This way, the clone's alternates reference the symlink path, making it work both:
-    // - Outside the container: symlink resolves to the real repo
-    // - Inside the container: repo is mounted at the symlink path
-    if !info.repo_symlink.exists() && !info.repo_symlink.is_symlink() {
-        symlink(&info.repo_root, &info.repo_symlink).with_context(|| {
-            format!(
-                "Failed to create symlink {} -> {}",
-                info.repo_symlink.display(),
-                info.repo_root.display()
-            )
-        })?;
-    }
+    // Ensure meta.git bare repository exists (shared across all sandboxes for this repo)
+    git::ensure_meta_git(&info.repo_root, &info.meta_git_dir)?;
 
-    // Create shared clone from the symlink path (not the real repo path)
-    // This ensures the clone references the symlink in its alternates
-    git::create_shared_clone(&info.repo_symlink, &info.clone_dir)?;
+    // Setup "sandbox" remote in host repo pointing to meta.git
+    git::setup_host_sandbox_remote(&info.repo_root, &info.meta_git_dir)?;
+
+    // Sync main branch from host to meta.git
+    git::sync_main_to_meta(&info.repo_root, &info.meta_git_dir)?;
+
+    // Create shared clone from meta.git
+    // The clone's alternates will reference meta_git_dir, which is mounted
+    // at the same path inside the container
+    git::create_shared_clone(&info.meta_git_dir, &info.clone_dir)?;
 
     // Checkout or create a branch named after the sandbox
     // This ensures all work in the sandbox happens on this branch
     git::checkout_or_create_branch(&info.clone_dir, name)?;
 
-    // Setup bidirectional remotes
-    git::setup_bidirectional_remotes(repo_root, &info.clone_dir, name)?;
+    // Setup remotes for the sandbox repo (rename "origin" to "sandbox")
+    git::setup_sandbox_remotes(&info.meta_git_dir, &info.clone_dir)?;
 
     // Save sandbox info
     info.save()?;

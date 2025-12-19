@@ -77,6 +77,13 @@ pub fn get_sandbox_instance_dir(repo_root: &Path, name: &str) -> Result<PathBuf>
     Ok(base.join(name))
 }
 
+/// Get the path to the meta.git bare repository for a repo.
+/// This bare repo is shared across all sandboxes for the same repository.
+pub fn get_meta_git_dir(repo_root: &Path) -> Result<PathBuf> {
+    let base = get_sandbox_base_dir(repo_root)?;
+    Ok(base.join("meta.git"))
+}
+
 /// Hash the contents of a file (used for Dockerfile hash-based image tagging).
 pub fn hash_file(path: &Path) -> Result<String> {
     let contents =
