@@ -1,11 +1,18 @@
-fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+use std::{env, process::ExitCode};
 
-    if let Err(e) = sandbox::run() {
-        eprintln!("Error: {:#}", e);
-        if std::env::var("RUST_BACKTRACE").is_ok() {
-            eprintln!("\nBacktrace:\n{}", e.backtrace());
+fn main() -> ExitCode {
+    env_logger::init();
+
+    match sandbox::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            let has_backtrace = env::var("RUST_BACKTRACE").as_ref().map(|s| s.as_str()) == Ok("1");
+            if has_backtrace {
+                eprintln!("Backtrace:\n{}", e.backtrace());
+            }
+
+            ExitCode::FAILURE
         }
-        std::process::exit(1);
     }
 }
