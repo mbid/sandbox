@@ -491,6 +491,53 @@ pub fn list_sandboxes(repo_root: &Path) -> Result<Vec<SandboxInfo>> {
     Ok(sandboxes)
 }
 
+/// Remove a directory and all its contents, fixing permissions as needed.
+/// This is similar to `std::fs::remove_dir_all` but handles permission issues
+/// by making directories/files writable before attempting deletion.
+fn remove_dir_all_with_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("Failed to get metadata for: {}", path.display()))?;
+
+    if metadata.is_dir() {
+        // Make directory readable/writable/executable so we can list and modify it
+        let mut perms = metadata.permissions();
+        perms.set_mode(perms.mode() | 0o700);
+        std::fs::set_permissions(path, perms)
+            .with_context(|| format!("Failed to set permissions for: {}", path.display()))?;
+
+        // Recursively delete contents
+        for entry in std::fs::read_dir(path)
+            .with_context(|| format!("Failed to read directory: {}", path.display()))?
+        {
+            let entry = entry?;
+            remove_dir_all_with_permissions(&entry.path())?;
+        }
+
+        // Remove the now-empty directory
+        std::fs::remove_dir(path)
+            .with_context(|| format!("Failed to remove directory: {}", path.display()))?;
+    } else {
+        // For files and symlinks, make writable then remove
+        if !metadata.is_symlink() {
+            let mut perms = metadata.permissions();
+            perms.set_mode(perms.mode() | 0o600);
+            std::fs::set_permissions(path, perms)
+                .with_context(|| format!("Failed to set permissions for: {}", path.display()))?;
+        }
+
+        std::fs::remove_file(path)
+            .with_context(|| format!("Failed to remove file: {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
 /// Delete a sandbox and its associated resources.
 pub fn delete_sandbox(info: &SandboxInfo) -> Result<()> {
     info!("Deleting sandbox: {}", info.name);
@@ -529,7 +576,7 @@ pub fn delete_sandbox(info: &SandboxInfo) -> Result<()> {
 
     // Remove sandbox directory (includes overlay upper/work dirs)
     if info.sandbox_dir.exists() {
-        std::fs::remove_dir_all(&info.sandbox_dir)
+        remove_dir_all_with_permissions(&info.sandbox_dir)
             .with_context(|| format!("Failed to remove: {}", info.sandbox_dir.display()))?;
     }
 
@@ -541,7 +588,7 @@ pub fn delete_sandbox(info: &SandboxInfo) -> Result<()> {
 
         // Remove meta.git
         if info.meta_git_dir.exists() {
-            std::fs::remove_dir_all(&info.meta_git_dir)
+            remove_dir_all_with_permissions(&info.meta_git_dir)
                 .with_context(|| format!("Failed to remove: {}", info.meta_git_dir.display()))?;
         }
 
