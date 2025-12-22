@@ -1,7 +1,6 @@
-use assert_cmd::Command;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Output;
+use std::process::{Command, Output};
 
 /// A test fixture that creates a temporary git repository in /tmp.
 /// The repository is initialized with a README.md file and an initial commit.
@@ -78,8 +77,7 @@ fn run_git(dir: &PathBuf, args: &[&str]) -> Output {
 
 /// Run the sandbox binary with the given arguments in a specific working directory.
 fn run_sandbox_in(working_dir: &PathBuf, args: &[&str]) -> Output {
-    Command::cargo_bin("sandbox")
-        .expect("Failed to find sandbox binary")
+    Command::new(assert_cmd::cargo::cargo_bin!("sandbox"))
         .current_dir(working_dir)
         .args(args)
         .output()
