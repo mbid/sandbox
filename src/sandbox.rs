@@ -706,7 +706,7 @@ pub fn run_sandbox(
 
 /// Ensure the container is running, starting it if necessary.
 /// Returns true if we launched a new container, false if it was already running.
-fn ensure_container_running(
+pub fn ensure_container_running(
     info: &SandboxInfo,
     image_tag: &str,
     user_info: &UserInfo,

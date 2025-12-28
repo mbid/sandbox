@@ -1,6 +1,7 @@
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 /// A test fixture that creates a temporary git repository in /tmp.
 /// The repository is initialized with a README.md file and an initial commit.
@@ -401,6 +402,56 @@ fn test_sync_with_history_rewrite() {
     );
 
     // Clean up
+    let output = run_sandbox_in(&repo.dir, &["delete", sandbox_name]);
+    assert!(
+        output.status.success(),
+        "Failed to delete sandbox: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_agent_reads_file() {
+    let repo = TestRepo::init();
+
+    fs::write(
+        repo.dir.join("Dockerfile"),
+        include_str!("Dockerfile-debian"),
+    )
+    .expect("Failed to write Dockerfile");
+
+    let secret_content = "SECRET_VALUE_12345";
+    fs::write(repo.dir.join("secret.txt"), secret_content).expect("Failed to write secret.txt");
+
+    run_git(&repo.dir, &["add", "Dockerfile", "secret.txt"]);
+    run_git(&repo.dir, &["commit", "-m", "Add Dockerfile and secret"]);
+
+    let sandbox_name = "test-agent";
+
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("sandbox"))
+        .current_dir(&repo.dir)
+        .args(["agent", sandbox_name, "--runtime", "runc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn agent");
+
+    let stdin = child.stdin.as_mut().expect("Failed to open stdin");
+    writeln!(stdin, "What is the content of the file secret.txt?")
+        .expect("Failed to write to stdin");
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("Failed to wait for agent");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(secret_content),
+        "Agent output should contain the secret content.\nstdout: {}\nstderr: {}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
     let output = run_sandbox_in(&repo.dir, &["delete", sandbox_name]);
     assert!(
         output.status.success(),

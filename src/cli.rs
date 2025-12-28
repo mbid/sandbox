@@ -1,7 +1,8 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use crate::agent;
 use crate::config::{OverlayMode, Runtime, UserInfo};
 use crate::docker;
 use crate::git;
@@ -44,6 +45,20 @@ pub enum Commands {
     Delete {
         /// Name of the sandbox to delete
         name: String,
+    },
+
+    /// Run an LLM agent inside a sandbox
+    Agent {
+        /// Name of the sandbox to use
+        name: String,
+
+        /// Container runtime to use for sandboxing
+        #[arg(short, long, value_enum, default_value_t = Runtime::Runsc)]
+        runtime: Runtime,
+
+        /// Strategy for copy-on-write mounts
+        #[arg(short, long, value_enum, default_value_t = OverlayMode::Overlayfs)]
+        overlay_mode: OverlayMode,
     },
 
     /// Internal: sync daemon process (not shown in help)
@@ -90,6 +105,13 @@ pub fn run() -> Result<()> {
                 Commands::Delete { name } => {
                     delete_sandbox(&repo_root, &name)?;
                 }
+                Commands::Agent {
+                    name,
+                    runtime,
+                    overlay_mode,
+                } => {
+                    run_agent(&repo_root, &name, &user_info, runtime, overlay_mode)?;
+                }
                 Commands::SyncDaemon { .. } => unreachable!(),
             }
         }
@@ -99,7 +121,7 @@ pub fn run() -> Result<()> {
 }
 
 fn run_sandbox(
-    repo_root: &PathBuf,
+    repo_root: &Path,
     name: &str,
     user_info: &UserInfo,
     runtime: Runtime,
@@ -128,12 +150,10 @@ fn run_sandbox(
         Some(command.as_slice())
     };
 
-    let result = sandbox::run_sandbox(&info, &image_tag, user_info, runtime, overlay_mode, cmd);
-
-    result
+    sandbox::run_sandbox(&info, &image_tag, user_info, runtime, overlay_mode, cmd)
 }
 
-fn list_sandboxes(repo_root: &PathBuf) -> Result<()> {
+fn list_sandboxes(repo_root: &Path) -> Result<()> {
     let sandboxes = sandbox::list_sandboxes(repo_root)?;
 
     if sandboxes.is_empty() {
@@ -159,7 +179,7 @@ fn list_sandboxes(repo_root: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn delete_sandbox(repo_root: &PathBuf, name: &str) -> Result<()> {
+fn delete_sandbox(repo_root: &Path, name: &str) -> Result<()> {
     let sandboxes = sandbox::list_sandboxes(repo_root)?;
 
     let info = sandboxes
@@ -171,4 +191,27 @@ fn delete_sandbox(repo_root: &PathBuf, name: &str) -> Result<()> {
     println!("Deleted sandbox: {}", name);
 
     Ok(())
+}
+
+fn run_agent(
+    repo_root: &Path,
+    name: &str,
+    user_info: &UserInfo,
+    runtime: Runtime,
+    overlay_mode: OverlayMode,
+) -> Result<()> {
+    let dockerfile = repo_root.join("Dockerfile");
+    if !dockerfile.exists() {
+        bail!(
+            "No Dockerfile found at {}. Please create a Dockerfile for the sandbox.",
+            dockerfile.display()
+        );
+    }
+
+    let image_tag = docker::build_image(&dockerfile, user_info)?;
+    let info = sandbox::ensure_sandbox(repo_root, name)?;
+
+    sandbox::ensure_container_running(&info, &image_tag, user_info, runtime, overlay_mode)?;
+
+    agent::run_agent(&info.container_name)
 }
