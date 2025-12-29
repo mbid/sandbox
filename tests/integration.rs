@@ -565,3 +565,54 @@ fn test_agent_writes_file() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn test_agent_handles_command_with_empty_output_and_nonzero_exit() {
+    // Regression test: The Anthropic API rejects tool_result blocks with empty
+    // content when is_error is true. Commands like `false` or `exit 1` produce
+    // no output but exit with non-zero status.
+    let repo = TestRepo::init();
+
+    fs::write(
+        repo.dir.join("Dockerfile"),
+        include_str!("Dockerfile-debian"),
+    )
+    .expect("Failed to write Dockerfile");
+
+    run_git(&repo.dir, &["add", "Dockerfile"]);
+    run_git(&repo.dir, &["commit", "-m", "Add Dockerfile"]);
+
+    let sandbox_name = "test-agent-empty-error";
+
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("sandbox"))
+        .current_dir(&repo.dir)
+        .args(["agent", sandbox_name, "--runtime", "runc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn agent");
+
+    let stdin = child.stdin.as_mut().expect("Failed to open stdin");
+    // Ask the agent to run `false` which exits with status 1 and no output
+    writeln!(stdin, "Run the command `false` and tell me what happened.")
+        .expect("Failed to write to stdin");
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("Failed to wait for agent");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The agent should NOT fail with the API error about empty content
+    assert!(
+        !stderr.contains("content cannot be empty"),
+        "Agent failed with empty content error.\nstderr: {}",
+        stderr
+    );
+
+    let output = run_sandbox_in(&repo.dir, &["delete", sandbox_name]);
+    assert!(
+        output.status.success(),
+        "Failed to delete sandbox: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
