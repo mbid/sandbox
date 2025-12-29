@@ -1,7 +1,8 @@
-use anyhow::{bail, Context, Result};
-use indoc::formatdoc;
+use anyhow::{Context, Result};
 use std::io::{BufRead, Write};
 use std::process::{Command, Stdio};
+use std::str::FromStr;
+use strum::{Display, EnumString};
 
 use crate::anthropic::{
     CacheControl, Client, ContentBlock, CustomTool, Message, MessagesRequest, Role, StopReason,
@@ -11,13 +12,18 @@ use crate::anthropic::{
 const MODEL: &str = "claude-haiku-4-5-20251001";
 const MAX_TOKENS: u32 = 4096;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumString)]
+#[strum(serialize_all = "lowercase")]
+enum AgentToolName {
+    Bash,
+    Edit,
+    Write,
+}
+
 fn bash_tool() -> Tool {
     Tool::Custom(CustomTool {
-        name: "bash".to_string(),
-        description: formatdoc! {"
-            Execute a bash command inside the sandbox and return the output.
-            Output is truncated to 30000 characters, but full output can be retrieved later if needed.
-        "},
+        name: AgentToolName::Bash.to_string(),
+        description: "Execute a bash command inside the sandbox and return the output.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -30,6 +36,184 @@ fn bash_tool() -> Tool {
         }),
         cache_control: None,
     })
+}
+
+fn edit_tool() -> Tool {
+    Tool::Custom(CustomTool {
+        name: AgentToolName::Edit.to_string(),
+        description: "Perform a search-and-replace edit on a file.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "The path to the file to modify (relative to repo root)"
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "The text to replace (must appear exactly once in the file)"
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "The replacement text"
+                }
+            },
+            "required": ["file_path", "old_string", "new_string"],
+            "additionalProperties": false
+        }),
+        cache_control: None,
+    })
+}
+
+fn write_tool() -> Tool {
+    Tool::Custom(CustomTool {
+        name: AgentToolName::Write.to_string(),
+        description: "Write content to a new file. Returns an error if the file already exists."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "The path to the file to create (relative to repo root)"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The content to write to the file"
+                }
+            },
+            "required": ["file_path", "content"],
+            "additionalProperties": false
+        }),
+        cache_control: None,
+    })
+}
+
+fn execute_edit_in_sandbox(
+    container_name: &str,
+    file_path: &str,
+    old_string: &str,
+    new_string: &str,
+) -> Result<(String, bool)> {
+    let output = Command::new("docker")
+        .args(["exec", container_name, "cat", file_path])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("Failed to read file in sandbox")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Ok((format!("Error reading file: {}", stderr), false));
+    }
+
+    let content = match String::from_utf8(output.stdout) {
+        Ok(s) => s,
+        Err(_) => return Ok(("File contains invalid UTF-8".to_string(), false)),
+    };
+
+    let count = content.matches(old_string).count();
+
+    if count == 0 {
+        return Ok((format!("old_string not found in {}", file_path), false));
+    }
+
+    if count > 1 {
+        return Ok((
+            format!(
+                "Found {} occurrences of old_string in {}. Provide more context to make the match unique.",
+                count, file_path
+            ),
+            false,
+        ));
+    }
+
+    let new_content = content.replacen(old_string, new_string, 1);
+
+    let write_cmd = format!("cat > '{}'", file_path.replace('\'', "'\\''"));
+    let mut write_process = Command::new("docker")
+        .args(["exec", "-i", container_name, "bash", "-c", &write_cmd])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to write file in sandbox")?;
+
+    let mut stdin = write_process
+        .stdin
+        .take()
+        .expect("Process was launched with piped stdin");
+    stdin
+        .write_all(new_content.as_bytes())
+        .context("Failed to write to stdin")?;
+    drop(stdin);
+
+    let output = write_process
+        .wait_with_output()
+        .context("Failed to wait for write process")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Ok((format!("Error writing file: {}", stderr), false));
+    }
+
+    Ok((format!("Successfully edited {}", file_path), true))
+}
+
+fn execute_write_in_sandbox(
+    container_name: &str,
+    file_path: &str,
+    content: &str,
+) -> Result<(String, bool)> {
+    let output = Command::new("docker")
+        .args(["exec", container_name, "test", "-e", file_path])
+        .output()
+        .context("Failed to check if file exists")?;
+
+    if output.status.success() {
+        return Ok((format!("File {} already exists", file_path), false));
+    }
+
+    if let Some(parent) = std::path::Path::new(file_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            let mkdir_cmd = format!(
+                "mkdir -p '{}'",
+                parent.display().to_string().replace('\'', "'\\''")
+            );
+            let _ = Command::new("docker")
+                .args(["exec", container_name, "bash", "-c", &mkdir_cmd])
+                .output();
+        }
+    }
+
+    let write_cmd = format!("cat > '{}'", file_path.replace('\'', "'\\''"));
+    let mut write_process = Command::new("docker")
+        .args(["exec", "-i", container_name, "bash", "-c", &write_cmd])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to write file in sandbox")?;
+
+    let mut stdin = write_process
+        .stdin
+        .take()
+        .expect("Process was launched with piped stdin");
+    stdin
+        .write_all(content.as_bytes())
+        .context("Failed to write to stdin")?;
+    drop(stdin);
+
+    let output = write_process
+        .wait_with_output()
+        .context("Failed to wait for write process")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Ok((format!("Error writing file: {}", stderr), false));
+    }
+
+    Ok((format!("Successfully wrote {}", file_path), true))
 }
 
 fn save_output_to_file(container_name: &str, data: &[u8]) -> Result<String> {
@@ -167,7 +351,7 @@ pub fn run_agent(container_name: &str) -> Result<()> {
                     cache_control: Some(CacheControl::default()),
                 }])),
                 messages: request_messages,
-                tools: Some(vec![bash_tool()]),
+                tools: Some(vec![bash_tool(), edit_tool(), write_tool()]),
                 temperature: None,
                 top_p: None,
                 top_k: None,
@@ -199,30 +383,75 @@ pub fn run_agent(container_name: &str) -> Result<()> {
                     }
                     ContentBlock::ToolUse { id, name, input } => {
                         has_tool_use = true;
-                        if name == "bash" {
-                            let command =
-                                input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                        let tool_name = AgentToolName::from_str(name)
+                            .map_err(|_| anyhow::anyhow!("Unknown tool: {}", name))?;
 
-                            // Print the command being executed with $ prefix
-                            println!("$ {}", command);
+                        let (output, success) = match tool_name {
+                            AgentToolName::Bash => {
+                                let command =
+                                    input.get("command").and_then(|v| v.as_str()).unwrap_or("");
 
-                            let (output, success) =
-                                execute_bash_in_sandbox(container_name, command)?;
+                                println!("$ {}", command);
 
-                            // Print the output
-                            if !output.is_empty() {
-                                println!("{}", output);
+                                let (output, success) =
+                                    execute_bash_in_sandbox(container_name, command)?;
+
+                                if !output.is_empty() {
+                                    println!("{}", output);
+                                }
+
+                                (output, success)
                             }
+                            AgentToolName::Edit => {
+                                let file_path = input
+                                    .get("file_path")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let old_string = input
+                                    .get("old_string")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let new_string = input
+                                    .get("new_string")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
 
-                            tool_results.push(ContentBlock::ToolResult {
-                                tool_use_id: id.clone(),
-                                content: output,
-                                is_error: if success { None } else { Some(true) },
-                                cache_control: None,
-                            });
-                        } else {
-                            bail!("Unknown tool: {}", name);
-                        }
+                                println!("[edit] {}", file_path);
+
+                                let (output, success) = execute_edit_in_sandbox(
+                                    container_name,
+                                    file_path,
+                                    old_string,
+                                    new_string,
+                                )?;
+
+                                println!("{}", output);
+                                (output, success)
+                            }
+                            AgentToolName::Write => {
+                                let file_path = input
+                                    .get("file_path")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let content =
+                                    input.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+                                println!("[write] {}", file_path);
+
+                                let (output, success) =
+                                    execute_write_in_sandbox(container_name, file_path, content)?;
+
+                                println!("{}", output);
+                                (output, success)
+                            }
+                        };
+
+                        tool_results.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: output,
+                            is_error: if success { None } else { Some(true) },
+                            cache_control: None,
+                        });
                     }
                     ContentBlock::ToolResult { .. } => {}
                     ContentBlock::Image { .. } => {}

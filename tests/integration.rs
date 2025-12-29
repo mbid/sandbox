@@ -459,3 +459,109 @@ fn test_agent_reads_file() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn test_agent_edits_file() {
+    let repo = TestRepo::init();
+
+    fs::write(
+        repo.dir.join("Dockerfile"),
+        include_str!("Dockerfile-debian"),
+    )
+    .expect("Failed to write Dockerfile");
+
+    let original_content = "Hello World";
+    fs::write(repo.dir.join("greeting.txt"), original_content)
+        .expect("Failed to write greeting.txt");
+
+    run_git(&repo.dir, &["add", "Dockerfile", "greeting.txt"]);
+    run_git(&repo.dir, &["commit", "-m", "Add Dockerfile and greeting"]);
+
+    let sandbox_name = "test-agent-edit";
+
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("sandbox"))
+        .current_dir(&repo.dir)
+        .args(["agent", sandbox_name, "--runtime", "runc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn agent");
+
+    let stdin = child.stdin.as_mut().expect("Failed to open stdin");
+    writeln!(
+        stdin,
+        "Edit the file greeting.txt to replace 'World' with 'Universe'. Then read the file and tell me its new content."
+    )
+    .expect("Failed to write to stdin");
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("Failed to wait for agent");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Universe"),
+        "Agent output should contain the edited content 'Universe'.\nstdout: {}\nstderr: {}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = run_sandbox_in(&repo.dir, &["delete", sandbox_name]);
+    assert!(
+        output.status.success(),
+        "Failed to delete sandbox: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_agent_writes_file() {
+    let repo = TestRepo::init();
+
+    fs::write(
+        repo.dir.join("Dockerfile"),
+        include_str!("Dockerfile-debian"),
+    )
+    .expect("Failed to write Dockerfile");
+
+    run_git(&repo.dir, &["add", "Dockerfile"]);
+    run_git(&repo.dir, &["commit", "-m", "Add Dockerfile"]);
+
+    let sandbox_name = "test-agent-write";
+    let expected_content = "WRITTEN_BY_AGENT_12345";
+
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("sandbox"))
+        .current_dir(&repo.dir)
+        .args(["agent", sandbox_name, "--runtime", "runc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn agent");
+
+    let stdin = child.stdin.as_mut().expect("Failed to open stdin");
+    writeln!(
+        stdin,
+        "Create a new file called newfile.txt with the content '{}'. Then read it back to confirm.",
+        expected_content
+    )
+    .expect("Failed to write to stdin");
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("Failed to wait for agent");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(expected_content),
+        "Agent output should contain the written content.\nstdout: {}\nstderr: {}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = run_sandbox_in(&repo.dir, &["delete", sandbox_name]);
+    assert!(
+        output.status.success(),
+        "Failed to delete sandbox: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
