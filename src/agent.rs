@@ -341,14 +341,20 @@ pub fn run_agent(container_name: &str, model: Model) -> Result<()> {
         });
 
         loop {
-            // Cache conversation history by marking the last user message. The API
-            // automatically looks back to find previously cached content.
+            // Cache conversation history by marking the last content block.
+            // Single breakpoint at the end is optimal for non-rewinding multi-turn agents.
             let mut request_messages = messages.clone();
             if let Some(last_msg) = request_messages.last_mut() {
                 if last_msg.role == Role::User {
                     if let Some(last_content) = last_msg.content.last_mut() {
-                        if let ContentBlock::Text { cache_control, .. } = last_content {
-                            *cache_control = Some(CacheControl::default());
+                        match last_content {
+                            ContentBlock::Text { cache_control, .. } => {
+                                *cache_control = Some(CacheControl::default());
+                            }
+                            ContentBlock::ToolResult { cache_control, .. } => {
+                                *cache_control = Some(CacheControl::default());
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -357,7 +363,7 @@ pub fn run_agent(container_name: &str, model: Model) -> Result<()> {
             let request = MessagesRequest {
                 model: model.api_model_id().to_string(),
                 max_tokens: MAX_TOKENS,
-                // Cache system prompt (first breakpoint).
+                // Cache static system prompt for reuse across all turns.
                 system: Some(SystemPrompt::Blocks(vec![SystemBlock::Text {
                     text: "You are a helpful assistant running inside a sandboxed environment. You can execute bash commands to help the user.".to_string(),
                     cache_control: Some(CacheControl::default()),
