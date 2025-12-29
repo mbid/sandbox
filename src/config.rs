@@ -25,6 +25,32 @@ pub enum OverlayMode {
     Copy,
 }
 
+/// Claude model to use for the agent.
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum Model {
+    /// Claude Opus 4.5 - most capable model
+    #[default]
+    #[value(name = "opus")]
+    Opus,
+    /// Claude Sonnet 4.5 - balanced performance and cost
+    #[value(name = "sonnet")]
+    Sonnet,
+    /// Claude Haiku 4.5 - fast and cost-effective
+    #[value(name = "haiku")]
+    Haiku,
+}
+
+impl Model {
+    /// Get the model identifier as used by the Anthropic API.
+    pub fn api_model_id(&self) -> &'static str {
+        match self {
+            Model::Opus => "claude-opus-4-5-20251101",
+            Model::Sonnet => "claude-sonnet-4-5-20250929",
+            Model::Haiku => "claude-haiku-4-5-20251001",
+        }
+    }
+}
+
 impl Runtime {
     /// Get the runtime name as used by Docker's --runtime flag.
     pub fn docker_runtime_name(&self) -> &'static str {

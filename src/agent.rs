@@ -8,8 +8,8 @@ use crate::anthropic::{
     CacheControl, Client, ContentBlock, CustomTool, Message, MessagesRequest, Role, StopReason,
     SystemBlock, SystemPrompt, Tool,
 };
+use crate::config::Model;
 
-const MODEL: &str = "claude-haiku-4-5-20251001";
 const MAX_TOKENS: u32 = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumString)]
@@ -301,7 +301,7 @@ fn execute_bash_in_sandbox(container_name: &str, command: &str) -> Result<(Strin
     Ok((combined, output.status.success()))
 }
 
-pub fn run_agent(container_name: &str) -> Result<()> {
+pub fn run_agent(container_name: &str, model: Model) -> Result<()> {
     let client = Client::from_env()?;
 
     let stdin = std::io::stdin();
@@ -343,7 +343,7 @@ pub fn run_agent(container_name: &str) -> Result<()> {
             }
 
             let request = MessagesRequest {
-                model: MODEL.to_string(),
+                model: model.api_model_id().to_string(),
                 max_tokens: MAX_TOKENS,
                 // Cache system prompt (first breakpoint).
                 system: Some(SystemPrompt::Blocks(vec![SystemBlock::Text {

@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
 use crate::agent;
-use crate::config::{OverlayMode, Runtime, UserInfo};
+use crate::config::{Model, OverlayMode, Runtime, UserInfo};
 use crate::docker;
 use crate::git;
 use crate::sandbox;
@@ -59,6 +59,10 @@ pub enum Commands {
         /// Strategy for copy-on-write mounts
         #[arg(short, long, value_enum, default_value_t = OverlayMode::Overlayfs)]
         overlay_mode: OverlayMode,
+
+        /// Claude model to use
+        #[arg(short, long, value_enum, default_value_t = Model::Opus)]
+        model: Model,
     },
 
     /// Internal: sync daemon process (not shown in help)
@@ -109,8 +113,9 @@ pub fn run() -> Result<()> {
                     name,
                     runtime,
                     overlay_mode,
+                    model,
                 } => {
-                    run_agent(&repo_root, &name, &user_info, runtime, overlay_mode)?;
+                    run_agent(&repo_root, &name, &user_info, runtime, overlay_mode, model)?;
                 }
                 Commands::SyncDaemon { .. } => unreachable!(),
             }
@@ -199,6 +204,7 @@ fn run_agent(
     user_info: &UserInfo,
     runtime: Runtime,
     overlay_mode: OverlayMode,
+    model: Model,
 ) -> Result<()> {
     let dockerfile = repo_root.join("Dockerfile");
     if !dockerfile.exists() {
@@ -213,5 +219,5 @@ fn run_agent(
 
     sandbox::ensure_container_running(&info, &image_tag, user_info, runtime, overlay_mode)?;
 
-    agent::run_agent(&info.container_name)
+    agent::run_agent(&info.container_name, model)
 }
