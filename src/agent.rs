@@ -298,7 +298,19 @@ fn execute_bash_in_sandbox(container_name: &str, command: &str) -> Result<(Strin
         }
     };
 
-    Ok((combined, output.status.success()))
+    let success = output.status.success();
+
+    // If command failed with no output, report the exit status
+    if !success && combined.is_empty() {
+        let exit_code = output
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        return Ok((format!("exited with status {}", exit_code), false));
+    }
+
+    Ok((combined, success))
 }
 
 pub fn run_agent(container_name: &str, model: Model) -> Result<()> {
@@ -445,6 +457,13 @@ pub fn run_agent(container_name: &str, model: Model) -> Result<()> {
                                 (output, success)
                             }
                         };
+
+                        // Anthropic API requires non-empty content when is_error is true.
+                        // Tool implementations must ensure this - panic if violated.
+                        assert!(
+                            success || !output.is_empty(),
+                            "Tool error with empty output - tool implementation must provide error message"
+                        );
 
                         tool_results.push(ContentBlock::ToolResult {
                             tool_use_id: id.clone(),
