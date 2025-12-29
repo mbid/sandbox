@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use indoc::formatdoc;
 use std::io::{BufRead, Write};
 use std::process::{Command, Stdio};
 
@@ -13,7 +14,10 @@ const MAX_TOKENS: u32 = 4096;
 fn bash_tool() -> Tool {
     Tool::Custom(CustomTool {
         name: "bash".to_string(),
-        description: "Execute a bash command inside the sandbox and return the output.".to_string(),
+        description: formatdoc! {"
+            Execute a bash command inside the sandbox and return the output.
+            Output is truncated to 30000 characters, but full output can be retrieved later if needed.
+        "},
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -28,7 +32,49 @@ fn bash_tool() -> Tool {
     })
 }
 
+fn save_output_to_file(container_name: &str, data: &[u8]) -> Result<String> {
+    // Generate a short random ID for the output file
+    let id = format!(
+        "{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            % 0xffffff
+    );
+
+    let output_file = format!("/agent/bash-output-{}", id);
+
+    // Create /agent directory if it doesn't exist
+    Command::new("docker")
+        .args(["exec", container_name, "bash", "-c", "mkdir -p /agent"])
+        .output()
+        .context("Failed to create /agent directory")?;
+
+    // Write the output to file
+    let write_cmd = format!("cat > {}", output_file);
+    let mut write_process = Command::new("docker")
+        .args(["exec", "-i", container_name, "bash", "-c", &write_cmd])
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("Failed to write output to file")?;
+
+    let mut stdin = write_process
+        .stdin
+        .take()
+        .expect("Process was launmched with piped stdin");
+    stdin.write_all(data).context("Failed to write to stdin")?;
+
+    write_process
+        .wait()
+        .context("Failed to wait for write process")?;
+
+    Ok(output_file)
+}
+
 fn execute_bash_in_sandbox(container_name: &str, command: &str) -> Result<(String, bool)> {
+    const MAX_OUTPUT_SIZE: usize = 30000;
+
     let output = Command::new("docker")
         .args(["exec", container_name, "bash", "-c", command])
         .stdout(Stdio::piped())
@@ -36,15 +82,36 @@ fn execute_bash_in_sandbox(container_name: &str, command: &str) -> Result<(Strin
         .output()
         .context("Failed to execute command in sandbox")?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    let combined = if stderr.is_empty() {
-        stdout.to_string()
-    } else if stdout.is_empty() {
-        stderr.to_string()
+    // Combine stdout and stderr as raw bytes
+    let combined_bytes = if output.stderr.is_empty() {
+        output.stdout.clone()
+    } else if output.stdout.is_empty() {
+        output.stderr.clone()
     } else {
-        format!("{}\n{}", stdout, stderr)
+        let mut combined = output.stdout.clone();
+        combined.push(b'\n');
+        combined.extend_from_slice(&output.stderr);
+        combined
+    };
+
+    // Check if output exceeds limit - save to file if so
+    if combined_bytes.len() > MAX_OUTPUT_SIZE {
+        let output_file = save_output_to_file(container_name, &combined_bytes)?;
+        let error_msg = format!("Full output available at {}", output_file);
+        return Ok((error_msg, false));
+    }
+
+    // Validate UTF-8 - save to file if invalid
+    let combined = match String::from_utf8(combined_bytes.clone()) {
+        Ok(s) => s,
+        Err(_) => {
+            let output_file = save_output_to_file(container_name, &combined_bytes)?;
+            let error_msg = format!(
+                "Output is not valid UTF-8. Full output available at {}",
+                output_file
+            );
+            return Ok((error_msg, false));
+        }
     };
 
     Ok((combined, output.status.success()))
@@ -136,8 +203,16 @@ pub fn run_agent(container_name: &str) -> Result<()> {
                             let command =
                                 input.get("command").and_then(|v| v.as_str()).unwrap_or("");
 
+                            // Print the command being executed with $ prefix
+                            println!("$ {}", command);
+
                             let (output, success) =
                                 execute_bash_in_sandbox(container_name, command)?;
+
+                            // Print the output
+                            if !output.is_empty() {
+                                println!("{}", output);
+                            }
 
                             tool_results.push(ContentBlock::ToolResult {
                                 tool_use_id: id.clone(),
