@@ -30,6 +30,7 @@ reflink-copy = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 indoc = { version = ">= 0" }
 strum = { version = "0.27.2", features = ["derive"] }
+backoff = "0.4"
 
 [dev-dependencies]
 assert_cmd = "2.0"

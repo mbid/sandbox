@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
+use backoff::{backoff::Backoff, ExponentialBackoff};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -236,27 +238,48 @@ impl Client {
     }
 
     pub fn messages(&self, request: MessagesRequest) -> Result<MessagesResponse> {
-        let response = self
-            .client
-            .post(ANTHROPIC_API_URL)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&request)
-            .send()
-            .context("Failed to send request to Anthropic API")?;
+        let mut backoff = ExponentialBackoff {
+            max_elapsed_time: None,
+            max_interval: Duration::from_secs(60),
+            ..Default::default()
+        };
 
-        if !response.status().is_success() {
+        let mut attempt = 0;
+        const MAX_RETRIES: u32 = 2;
+
+        loop {
+            let response = self
+                .client
+                .post(ANTHROPIC_API_URL)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .header("content-type", "application/json")
+                .json(&request)
+                .send()
+                .context("Failed to send request to Anthropic API")?;
+
             let status = response.status();
+
+            if status.is_success() {
+                let response: MessagesResponse = response
+                    .json()
+                    .context("Failed to parse Anthropic API response")?;
+                return Ok(response);
+            }
+
+            let should_retry = matches!(status.as_u16(), 429 | 500 | 504 | 529);
+
+            if should_retry && attempt < MAX_RETRIES {
+                attempt += 1;
+                if let Some(delay) = backoff.next_backoff() {
+                    std::thread::sleep(delay);
+                    continue;
+                }
+            }
+
             let error_text = response.text().unwrap_or_default();
             anyhow::bail!("Anthropic API error (status {}): {}", status, error_text);
         }
-
-        let response: MessagesResponse = response
-            .json()
-            .context("Failed to parse Anthropic API response")?;
-
-        Ok(response)
     }
 }
 
