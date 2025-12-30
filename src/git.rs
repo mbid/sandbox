@@ -290,6 +290,60 @@ pub fn sync_meta_to_host(host_repo: &Path, meta_git_dir: &Path, branch: &str) ->
     Ok(())
 }
 
+/// Sync branches from meta.git to the sandbox repo's remote tracking refs.
+/// Updates refs/remotes/sandbox/master and refs/remotes/sandbox/<sandbox_name>.
+pub fn sync_meta_to_sandbox(
+    meta_git_dir: &Path,
+    sandbox_repo: &Path,
+    sandbox_name: &str,
+) -> Result<()> {
+    let primary_branch = get_primary_branch(meta_git_dir)?;
+
+    // Fetch master/main branch from meta.git to sandbox's remote tracking ref
+    let status = Command::new("git")
+        .current_dir(sandbox_repo)
+        .args([
+            "fetch",
+            &meta_git_dir.to_string_lossy(),
+            &format!(
+                "+refs/heads/{}:refs/remotes/sandbox/{}",
+                primary_branch, primary_branch
+            ),
+        ])
+        .status()
+        .context("Failed to sync primary branch to sandbox")?;
+
+    if !status.success() {
+        bail!(
+            "Failed to sync {} branch from meta.git to sandbox",
+            primary_branch
+        );
+    }
+
+    // Fetch sandbox branch from meta.git to sandbox's remote tracking ref
+    let status = Command::new("git")
+        .current_dir(sandbox_repo)
+        .args([
+            "fetch",
+            &meta_git_dir.to_string_lossy(),
+            &format!(
+                "+refs/heads/{}:refs/remotes/sandbox/{}",
+                sandbox_name, sandbox_name
+            ),
+        ])
+        .status()
+        .context("Failed to sync sandbox branch to sandbox remote")?;
+
+    if !status.success() {
+        bail!(
+            "Failed to sync {} branch from meta.git to sandbox",
+            sandbox_name
+        );
+    }
+
+    Ok(())
+}
+
 /// Setup the "sandbox" remote in the host repo pointing to meta.git.
 pub fn setup_host_sandbox_remote(host_repo: &Path, meta_git_dir: &Path) -> Result<()> {
     add_remote(host_repo, "sandbox", meta_git_dir)

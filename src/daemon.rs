@@ -214,37 +214,64 @@ fn wait_for_socket_connectable(sock_path: &Path, lock_path: &Path) -> Result<Uni
     }
 }
 
-fn run_git_sync_thread(info: SandboxInfo) {
+fn run_full_git_sync(info: &SandboxInfo) -> Result<()> {
+    git::sync_sandbox_to_meta(&info.meta_git_dir, &info.clone_dir, &info.name)
+        .context("syncing sandbox to meta.git")?;
+    git::sync_main_to_meta(&info.repo_root, &info.meta_git_dir)
+        .context("syncing main branch to meta.git")?;
+    git::sync_meta_to_host(&info.repo_root, &info.meta_git_dir, &info.name)
+        .context("syncing meta.git to host")?;
+    git::sync_meta_to_sandbox(&info.meta_git_dir, &info.clone_dir, &info.name)
+        .context("syncing meta.git to sandbox")?;
+    Ok(())
+}
+
+fn run_git_sync_thread(info: SandboxInfo) -> Result<()> {
     let debounce = Duration::from_millis(500);
-    let main_sync_interval = Duration::from_secs(30);
     let mut last_sync = Instant::now();
-    let mut last_main_sync = Instant::now();
     let mut pending_sync = false;
 
     let (tx, rx) = mpsc::channel();
-    let mut watcher = match RecommendedWatcher::new(
+    let mut watcher = RecommendedWatcher::new(
         move |res| {
             let _ = tx.send(res);
         },
-        Config::default().with_poll_interval(Duration::from_secs(1)),
-    ) {
-        Ok(w) => w,
-        Err(e) => {
-            error!("Failed to create watcher: {}", e);
-            return;
-        }
-    };
+        Config::default(),
+    )
+    .context("creating watcher")?;
 
-    let sandbox_git = info.clone_dir.join(".git");
-    if sandbox_git.exists() {
-        if let Err(e) = watcher.watch(&sandbox_git, RecursiveMode::Recursive) {
-            error!("Failed to watch {}: {}", sandbox_git.display(), e);
-            return;
-        }
-        info!("Git sync thread watching: {}", sandbox_git.display());
-    } else {
-        info!("No .git directory found at {}", sandbox_git.display());
-        return;
+    // Watch the three refs/heads directories with non-recursive watchers
+    let host_refs = info.repo_root.join(".git/refs/heads");
+    let meta_refs = info.meta_git_dir.join("refs/heads");
+    let sandbox_refs = info.clone_dir.join(".git/refs/heads");
+
+    std::fs::create_dir_all(&host_refs)
+        .with_context(|| format!("creating {}", host_refs.display()))?;
+    std::fs::create_dir_all(&meta_refs)
+        .with_context(|| format!("creating {}", meta_refs.display()))?;
+    std::fs::create_dir_all(&sandbox_refs)
+        .with_context(|| format!("creating {}", sandbox_refs.display()))?;
+
+    watcher
+        .watch(&host_refs, RecursiveMode::NonRecursive)
+        .with_context(|| format!("watching {}", host_refs.display()))?;
+    watcher
+        .watch(&meta_refs, RecursiveMode::NonRecursive)
+        .with_context(|| format!("watching {}", meta_refs.display()))?;
+    watcher
+        .watch(&sandbox_refs, RecursiveMode::NonRecursive)
+        .with_context(|| format!("watching {}", sandbox_refs.display()))?;
+
+    info!(
+        "Git sync watching: {}, {}, {}",
+        host_refs.display(),
+        meta_refs.display(),
+        sandbox_refs.display()
+    );
+
+    // Run initial sync
+    if let Err(e) = run_full_git_sync(&info) {
+        error!("Initial git sync failed: {:#}", e);
     }
 
     loop {
@@ -260,31 +287,18 @@ fn run_git_sync_thread(info: SandboxInfo) {
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 info!("Git sync watcher channel disconnected");
-                return;
+                return Ok(());
             }
         }
 
         let now = Instant::now();
 
         if pending_sync && now.duration_since(last_sync) > debounce {
-            if let Err(e) =
-                git::sync_sandbox_to_meta(&info.meta_git_dir, &info.clone_dir, &info.name)
-            {
-                error!("Error syncing sandbox to meta.git: {}", e);
-            } else if let Err(e) =
-                git::sync_meta_to_host(&info.repo_root, &info.meta_git_dir, &info.name)
-            {
-                error!("Error syncing meta.git to host: {}", e);
+            if let Err(e) = run_full_git_sync(&info) {
+                error!("Git sync failed: {:#}", e);
             }
             last_sync = now;
             pending_sync = false;
-        }
-
-        if now.duration_since(last_main_sync) > main_sync_interval {
-            if let Err(e) = git::sync_main_to_meta(&info.repo_root, &info.meta_git_dir) {
-                error!("Error syncing main branch: {}", e);
-            }
-            last_main_sync = now;
         }
     }
 }
@@ -430,7 +444,9 @@ pub fn run_daemon_with_sync(
 
                                 let sync_info = info.clone();
                                 thread::spawn(move || {
-                                    run_git_sync_thread(sync_info);
+                                    if let Err(e) = run_git_sync_thread(sync_info) {
+                                        error!("Git sync thread failed: {:#}", e);
+                                    }
                                 });
                             }
                             Err(e) => {
@@ -481,10 +497,8 @@ pub fn run_daemon_with_sync(
     drop(listener);
 
     info!("Running final sync before shutdown...");
-    if let Err(e) = git::sync_sandbox_to_meta(&info.meta_git_dir, &info.clone_dir, &info.name) {
-        error!("Error in final sandbox sync: {}", e);
-    } else if let Err(e) = git::sync_meta_to_host(&info.repo_root, &info.meta_git_dir, &info.name) {
-        error!("Error in final meta-to-host sync: {}", e);
+    if let Err(e) = run_full_git_sync(info) {
+        error!("Final git sync failed: {:#}", e);
     }
 
     info!("Stopping container...");
