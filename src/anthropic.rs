@@ -105,16 +105,19 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
-    /// Server-side tool use (e.g., web_search)
+    /// Server-side tool use (e.g., web_search, web_fetch)
     ServerToolUse {
         id: String,
         name: String,
         input: serde_json::Value,
     },
-    /// Result from a server-side tool (e.g., web search results)
     WebSearchToolResult {
         tool_use_id: String,
         content: Vec<WebSearchResult>,
+    },
+    WebFetchToolResult {
+        tool_use_id: String,
+        content: WebFetchResult,
     },
 }
 
@@ -129,6 +132,37 @@ pub enum WebSearchResult {
         #[serde(default)]
         page_age: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WebFetchResult {
+    WebFetchResult {
+        url: String,
+        content: WebFetchContent,
+        retrieved_at: String,
+    },
+    WebFetchToolError {
+        error_code: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebFetchContent {
+    #[serde(rename = "type")]
+    pub content_type: String,
+    pub source: WebFetchSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum WebFetchSource {
+    #[serde(rename = "text")]
+    Text { media_type: String, data: String },
+    #[serde(rename = "base64")]
+    Base64 { media_type: String, data: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +194,12 @@ pub enum WebSearchToolType {
     WebSearch20250305,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FetchToolType {
+    #[serde(rename = "web_fetch_20250910")]
+    WebFetch20250910,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "name")]
 pub enum ServerTool {
@@ -175,6 +215,17 @@ pub enum ServerTool {
         blocked_domains: Option<Vec<String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         user_location: Option<UserLocation>,
+    },
+    #[serde(rename = "web_fetch")]
+    WebFetch {
+        #[serde(rename = "type")]
+        tool_type: FetchToolType,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_uses: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allowed_domains: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        blocked_domains: Option<Vec<String>>,
     },
 }
 
@@ -276,6 +327,7 @@ impl Client {
                 .post(ANTHROPIC_API_URL)
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", ANTHROPIC_VERSION)
+                .header("anthropic-beta", "web-fetch-2025-09-10")
                 .header("content-type", "application/json")
                 .json(&request)
                 .send()

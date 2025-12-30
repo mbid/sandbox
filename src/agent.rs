@@ -5,8 +5,8 @@ use std::str::FromStr;
 use strum::{Display, EnumString};
 
 use crate::anthropic::{
-    CacheControl, Client, ContentBlock, CustomTool, Message, MessagesRequest, Role, ServerTool,
-    StopReason, SystemBlock, SystemPrompt, Tool, WebSearchToolType,
+    CacheControl, Client, ContentBlock, CustomTool, FetchToolType, Message, MessagesRequest, Role,
+    ServerTool, StopReason, SystemBlock, SystemPrompt, Tool, WebSearchToolType,
 };
 use crate::config::Model;
 
@@ -99,6 +99,15 @@ fn websearch_tool() -> Tool {
         allowed_domains: None,
         blocked_domains: None,
         user_location: None,
+    })
+}
+
+fn fetch_tool() -> Tool {
+    Tool::Server(ServerTool::WebFetch {
+        tool_type: FetchToolType::WebFetch20250910,
+        max_uses: None,
+        allowed_domains: None,
+        blocked_domains: None,
     })
 }
 
@@ -513,6 +522,7 @@ pub fn run_agent(container_name: &str, model: Model) -> Result<()> {
                     edit_tool(),
                     write_tool(),
                     websearch_tool(),
+                    fetch_tool(),
                 ]),
                 temperature: None,
                 top_p: None,
@@ -610,9 +620,10 @@ pub fn run_agent(container_name: &str, model: Model) -> Result<()> {
                     }
                     ContentBlock::ToolResult { .. } => {}
                     ContentBlock::Image { .. } => {}
-                    // Server-side tools (like web search) are handled by the API
+                    // Server-side tools (like web search, web fetch) are handled by the API
                     ContentBlock::ServerToolUse { .. } => {}
                     ContentBlock::WebSearchToolResult { .. } => {}
+                    ContentBlock::WebFetchToolResult { .. } => {}
                 }
             }
 
