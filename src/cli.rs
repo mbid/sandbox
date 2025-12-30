@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use chrono;
 use clap::{Parser, Subcommand};
 use env_logger::Builder;
 use std::fs::OpenOptions;
@@ -283,15 +284,18 @@ fn run_sandbox(
 }
 
 fn list_sandboxes(repo_root: &Path) -> Result<()> {
-    let sandboxes = sandbox::list_sandboxes(repo_root)?;
+    let mut sandboxes = sandbox::list_sandboxes(repo_root)?;
 
     if sandboxes.is_empty() {
         println!("No sandboxes found for this repository.");
         return Ok(());
     }
 
-    println!("{:<20} {:<15} {:<30}", "NAME", "STATUS", "CREATED");
-    println!("{}", "-".repeat(65));
+    // Sort by created_at, most recent first
+    sandboxes.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    println!("{:<20} {:<15} {:<20}", "NAME", "STATUS", "CREATED");
+    println!("{}", "-".repeat(55));
 
     for info in sandboxes {
         let status = if docker::container_is_running(&info.container_name)? {
@@ -302,7 +306,12 @@ fn list_sandboxes(repo_root: &Path) -> Result<()> {
             "not started"
         };
 
-        println!("{:<20} {:<15} {:<30}", info.name, status, info.created_at);
+        // Format date more human-friendly
+        let created = chrono::DateTime::parse_from_rfc3339(&info.created_at)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or(info.created_at.clone());
+
+        println!("{:<20} {:<15} {:<20}", info.name, status, created);
     }
 
     Ok(())
