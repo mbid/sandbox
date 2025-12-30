@@ -18,28 +18,23 @@ const FIRST_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn socket_path(info: &SandboxInfo) -> PathBuf {
     // Unix domain sockets have a 108-char path limit on Linux.
-    // Use /tmp with a hash to keep paths short.
+    // Use /tmp/sandbox/ with a hash to keep paths short.
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(info.sandbox_dir.to_string_lossy().as_bytes());
     let hash = hex::encode(&hasher.finalize()[..8]);
-    PathBuf::from(format!("/tmp/sandbox-{}.sock", hash))
+    PathBuf::from(format!("/tmp/sandbox/{}.sock", hash))
 }
 
 fn bind_socket(sock_path: &Path, log_file: &mut std::fs::File) -> Result<UnixListener> {
     let temp_path = sock_path.with_extension("sock.tmp");
 
-    // Verify parent directory exists
+    // Create parent directory if needed
     if let Some(parent) = temp_path.parent() {
         if !parent.exists() {
-            log(
-                log_file,
-                &format!("Parent directory does not exist: {}", parent.display()),
-            );
-            bail!(
-                "Socket parent directory does not exist: {}",
-                parent.display()
-            );
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create socket directory: {}", parent.display())
+            })?;
         }
     }
 
@@ -141,13 +136,19 @@ pub fn connect_or_launch(
             Ok(stream) => {
                 debug!("Connected to existing daemon");
                 let mut conn = DaemonConnection { stream };
-                conn.wait_for_ready()?;
-                return Ok(conn);
+                match conn.wait_for_ready() {
+                    Ok(()) => return Ok(conn),
+                    Err(_) => {
+                        // Connected but daemon is shutting down - wait for it to finish
+                        debug!("Daemon is shutting down, waiting for socket to disappear...");
+                        wait_for_socket_removal(&sock_path)?;
+                    }
+                }
             }
             Err(_) => {
-                // Socket exists but daemon is dead - clean up stale socket
-                debug!("Removing stale socket and launching new daemon");
-                let _ = std::fs::remove_file(&sock_path);
+                // Socket exists but can't connect - daemon may be shutting down
+                debug!("Cannot connect to daemon, waiting for socket to disappear...");
+                wait_for_socket_removal(&sock_path)?;
             }
         }
     }
@@ -203,19 +204,115 @@ fn spawn_daemon(
     Ok(())
 }
 
-fn wait_for_socket(sock_path: &Path) -> Result<()> {
-    let timeout = Duration::from_secs(30);
-    let poll_interval = Duration::from_millis(10);
-    let start = Instant::now();
-
-    while !sock_path.exists() {
-        if start.elapsed() > timeout {
-            bail!("Timeout waiting for daemon socket");
-        }
-        std::thread::sleep(poll_interval);
+fn wait_for_socket_removal(sock_path: &Path) -> Result<()> {
+    // Check if already gone
+    if !sock_path.exists() {
+        return Ok(());
     }
 
-    Ok(())
+    let timeout = Duration::from_secs(30);
+    let start = Instant::now();
+
+    let parent = sock_path
+        .parent()
+        .context("Socket path has no parent directory")?;
+
+    let (tx, rx) = mpsc::channel();
+    let mut watcher = RecommendedWatcher::new(
+        move |res| {
+            let _ = tx.send(res);
+        },
+        Config::default(),
+    )?;
+    watcher.watch(parent, RecursiveMode::NonRecursive)?;
+
+    // Check again after setting up watcher
+    if !sock_path.exists() {
+        return Ok(());
+    }
+
+    loop {
+        let remaining = timeout.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            bail!("Timeout waiting for daemon to shut down");
+        }
+
+        match rx.recv_timeout(remaining) {
+            Ok(Ok(_event)) => {
+                if !sock_path.exists() {
+                    return Ok(());
+                }
+            }
+            Ok(Err(e)) => {
+                bail!("File watcher error: {}", e);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                bail!("Timeout waiting for daemon to shut down");
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("File watcher disconnected");
+            }
+        }
+    }
+}
+
+fn wait_for_socket(sock_path: &Path) -> Result<()> {
+    // Check if already exists
+    if sock_path.exists() {
+        return Ok(());
+    }
+
+    let timeout = Duration::from_secs(30);
+    let start = Instant::now();
+
+    // Watch the parent directory for the socket file to appear
+    let parent = sock_path
+        .parent()
+        .context("Socket path has no parent directory")?;
+
+    // Create parent directory if it doesn't exist (daemon might not have created it yet)
+    if !parent.exists() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create socket directory: {}", parent.display()))?;
+    }
+
+    let (tx, rx) = mpsc::channel();
+    let mut watcher = RecommendedWatcher::new(
+        move |res| {
+            let _ = tx.send(res);
+        },
+        Config::default(),
+    )?;
+    watcher.watch(parent, RecursiveMode::NonRecursive)?;
+
+    // Check again after setting up watcher (in case file appeared between check and watch)
+    if sock_path.exists() {
+        return Ok(());
+    }
+
+    loop {
+        let remaining = timeout.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            bail!("Timeout waiting for daemon socket");
+        }
+
+        match rx.recv_timeout(remaining) {
+            Ok(Ok(_event)) => {
+                if sock_path.exists() {
+                    return Ok(());
+                }
+            }
+            Ok(Err(e)) => {
+                bail!("File watcher error: {}", e);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                bail!("Timeout waiting for daemon socket");
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("File watcher disconnected");
+            }
+        }
+    }
 }
 
 fn log(file: &mut std::fs::File, message: &str) {
@@ -375,9 +472,6 @@ pub fn run_daemon_with_sync(
 
         if container_started && clients.is_empty() && pending_clients.is_empty() {
             log(&mut log_file, "All clients disconnected, shutting down...");
-            // Remove socket before breaking to prevent new clients from connecting
-            // to a daemon that's shutting down
-            cleanup_socket(&sock_path);
             break;
         }
 
