@@ -29,7 +29,6 @@ fn socket_path(info: &SandboxInfo) -> PathBuf {
 fn bind_socket(sock_path: &Path, log_file: &mut std::fs::File) -> Result<UnixListener> {
     let temp_path = sock_path.with_extension("sock.tmp");
 
-    // Create parent directory if needed
     if let Some(parent) = temp_path.parent() {
         if !parent.exists() {
             std::fs::create_dir_all(parent).with_context(|| {
@@ -38,7 +37,6 @@ fn bind_socket(sock_path: &Path, log_file: &mut std::fs::File) -> Result<UnixLis
         }
     }
 
-    // Clean up any stale temp socket
     let _ = std::fs::remove_file(&temp_path);
 
     let listener = UnixListener::bind(&temp_path).with_context(|| {
@@ -132,31 +130,21 @@ pub fn connect_or_launch(
     let sock_path = socket_path(info);
 
     if sock_path.exists() {
-        match UnixStream::connect(&sock_path) {
-            Ok(stream) => {
-                debug!("Connected to existing daemon");
-                let mut conn = DaemonConnection { stream };
-                match conn.wait_for_ready() {
-                    Ok(()) => return Ok(conn),
-                    Err(_) => {
-                        // Connected but daemon is shutting down - wait for it to finish
-                        debug!("Daemon is shutting down, waiting for socket to disappear...");
-                        wait_for_socket_removal(&sock_path)?;
-                    }
-                }
-            }
-            Err(_) => {
-                // Socket exists but can't connect - daemon may be shutting down
-                debug!("Cannot connect to daemon, waiting for socket to disappear...");
-                wait_for_socket_removal(&sock_path)?;
-            }
-        }
+        let stream = UnixStream::connect(&sock_path).with_context(|| {
+            format!(
+                "Socket exists at {} but cannot connect",
+                sock_path.display()
+            )
+        })?;
+        debug!("Connected to existing daemon");
+        let mut conn = DaemonConnection { stream };
+        conn.wait_for_ready()?;
+        return Ok(conn);
     }
 
     debug!("Launching daemon...");
     spawn_daemon(info, image_tag, user_info, runtime, overlay_mode, env_vars)?;
 
-    debug!("Waiting for daemon socket to appear...");
     wait_for_socket(&sock_path)?;
 
     let stream =
@@ -204,60 +192,7 @@ fn spawn_daemon(
     Ok(())
 }
 
-fn wait_for_socket_removal(sock_path: &Path) -> Result<()> {
-    // Check if already gone
-    if !sock_path.exists() {
-        return Ok(());
-    }
-
-    let timeout = Duration::from_secs(30);
-    let start = Instant::now();
-
-    let parent = sock_path
-        .parent()
-        .context("Socket path has no parent directory")?;
-
-    let (tx, rx) = mpsc::channel();
-    let mut watcher = RecommendedWatcher::new(
-        move |res| {
-            let _ = tx.send(res);
-        },
-        Config::default(),
-    )?;
-    watcher.watch(parent, RecursiveMode::NonRecursive)?;
-
-    // Check again after setting up watcher
-    if !sock_path.exists() {
-        return Ok(());
-    }
-
-    loop {
-        let remaining = timeout.saturating_sub(start.elapsed());
-        if remaining.is_zero() {
-            bail!("Timeout waiting for daemon to shut down");
-        }
-
-        match rx.recv_timeout(remaining) {
-            Ok(Ok(_event)) => {
-                if !sock_path.exists() {
-                    return Ok(());
-                }
-            }
-            Ok(Err(e)) => {
-                bail!("File watcher error: {}", e);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                bail!("Timeout waiting for daemon to shut down");
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                bail!("File watcher disconnected");
-            }
-        }
-    }
-}
-
 fn wait_for_socket(sock_path: &Path) -> Result<()> {
-    // Check if already exists
     if sock_path.exists() {
         return Ok(());
     }
@@ -265,12 +200,11 @@ fn wait_for_socket(sock_path: &Path) -> Result<()> {
     let timeout = Duration::from_secs(30);
     let start = Instant::now();
 
-    // Watch the parent directory for the socket file to appear
     let parent = sock_path
         .parent()
         .context("Socket path has no parent directory")?;
 
-    // Create parent directory if it doesn't exist (daemon might not have created it yet)
+    // Daemon might not have created it yet
     if !parent.exists() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create socket directory: {}", parent.display()))?;
@@ -285,7 +219,7 @@ fn wait_for_socket(sock_path: &Path) -> Result<()> {
     )?;
     watcher.watch(parent, RecursiveMode::NonRecursive)?;
 
-    // Check again after setting up watcher (in case file appeared between check and watch)
+    // File may have appeared between initial check and watch setup
     if sock_path.exists() {
         return Ok(());
     }
@@ -378,7 +312,6 @@ pub fn run_daemon_with_sync(
     let mut pending_sync = false;
 
     loop {
-        // Accept new connections
         match listener.accept() {
             Ok((mut stream, _)) => {
                 log(
@@ -390,13 +323,11 @@ pub fn run_daemon_with_sync(
                 );
 
                 if container_started {
-                    // Container is already running, send ready signal immediately
                     if stream.write_all(&[0u8]).is_ok() {
                         stream.set_nonblocking(true).ok();
                         clients.push(stream);
                     }
                 } else {
-                    // Queue client until container is ready
                     let is_first = pending_clients.is_empty();
                     pending_clients.push(stream);
 
@@ -417,7 +348,6 @@ pub fn run_daemon_with_sync(
                                 container_started = true;
                                 log(&mut log_file, "Container started successfully");
 
-                                // Send ready signal to all pending clients
                                 for mut client in pending_clients.drain(..) {
                                     if client.write_all(&[0u8]).is_ok() {
                                         client.set_nonblocking(true).ok();
@@ -425,7 +355,6 @@ pub fn run_daemon_with_sync(
                                     }
                                 }
 
-                                // Start file watcher for git sync
                                 let tx_clone = tx.clone();
                                 let mut watcher = RecommendedWatcher::new(
                                     move |res| {
@@ -459,7 +388,6 @@ pub fn run_daemon_with_sync(
             }
         }
 
-        // Check for disconnected clients
         clients.retain_mut(|stream| {
             let mut buf = [0u8; 1];
             match stream.read(&mut buf) {
@@ -488,7 +416,6 @@ pub fn run_daemon_with_sync(
             return Ok(());
         }
 
-        // Process git sync events
         if container_started {
             match rx.try_recv() {
                 Ok(Ok(event)) => {
@@ -507,7 +434,6 @@ pub fn run_daemon_with_sync(
 
             let now = Instant::now();
 
-            // Sync sandbox changes to host
             if pending_sync && now.duration_since(last_sync) > debounce {
                 if let Err(e) =
                     git::sync_sandbox_to_meta(&info.meta_git_dir, &info.clone_dir, &info.name)
@@ -528,7 +454,6 @@ pub fn run_daemon_with_sync(
                 pending_sync = false;
             }
 
-            // Periodically sync main branch from host
             if now.duration_since(last_main_sync) > main_sync_interval {
                 if let Err(e) = git::sync_main_to_meta(&info.repo_root, &info.meta_git_dir) {
                     log(&mut log_file, &format!("Error syncing main branch: {}", e));
@@ -540,7 +465,6 @@ pub fn run_daemon_with_sync(
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // Final sync before shutdown
     log(&mut log_file, "Running final sync before shutdown...");
     if let Err(e) = git::sync_sandbox_to_meta(&info.meta_git_dir, &info.clone_dir, &info.name) {
         log(
