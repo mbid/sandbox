@@ -272,8 +272,9 @@ fn save_output_to_file(container_name: &str, data: &[u8]) -> Result<String> {
     let mut stdin = write_process
         .stdin
         .take()
-        .expect("Process was launmched with piped stdin");
+        .expect("Process was launched with piped stdin");
     stdin.write_all(data).context("Failed to write to stdin")?;
+    drop(stdin);
 
     write_process
         .wait()
