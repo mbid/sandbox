@@ -256,6 +256,26 @@ fn save_output_to_file(container_name: &str, data: &[u8]) -> Result<String> {
     Ok(output_file)
 }
 
+/// Prompts user to confirm exit when they submit empty input.
+/// Returns true if user wants to exit (Enter or 'y'), false otherwise.
+fn confirm_exit() -> Result<bool> {
+    eprint!("Exit? [Y/n] ");
+    std::io::stderr().flush()?;
+
+    let mut buf = [0u8; 1];
+    let bytes_read = std::io::stdin().read(&mut buf)?;
+
+    if bytes_read == 0 || buf[0] == b'\n' || buf[0] == b'y' || buf[0] == b'Y' {
+        return Ok(true);
+    }
+
+    // Discard remaining input so it doesn't leak to the next prompt
+    let mut discard = String::new();
+    std::io::stdin().read_line(&mut discard)?;
+
+    Ok(false)
+}
+
 /// Get user input by launching vim on a temp file containing the chat history.
 /// Returns the new message (content after the chat history prefix).
 /// If the user doesn't preserve the chat history prefix, prompts to retry.
@@ -400,6 +420,9 @@ pub fn run_agent(container_name: &str, model: Model) -> Result<()> {
         } else {
             let input = get_input_via_vim(&chat_history)?;
             if input.is_empty() {
+                if confirm_exit()? {
+                    break;
+                }
                 continue;
             }
             input
