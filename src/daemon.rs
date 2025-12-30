@@ -122,16 +122,11 @@ pub fn connect_or_launch(
     let lock_path = lockfile_path(info);
 
     // Try to connect to existing socket
-    if sock_path.exists() {
-        match UnixStream::connect(&sock_path) {
-            Ok(stream) => {
-                debug!("Connected to existing daemon");
-                let mut conn = DaemonConnection { stream };
-                conn.wait_for_ready()?;
-                return Ok(conn);
-            }
-            Err(_) => {}
-        }
+    if let Ok(stream) = UnixStream::connect(&sock_path) {
+        debug!("Connected to existing daemon");
+        let mut conn = DaemonConnection { stream };
+        conn.wait_for_ready()?;
+        return Ok(conn);
     }
 
     // Spawn a new daemon (it will handle lock acquisition with backoff)
