@@ -1052,3 +1052,62 @@ touch "$MARKER"
         String::from_utf8_lossy(&delete_output.stderr)
     );
 }
+
+#[test]
+fn test_agent_websearch() {
+    // Test that the agent can use web search to find information beyond its knowledge cutoff.
+    // The US penny production ended in November 2025, after the model's training data.
+    let repo = TestRepo::init();
+
+    fs::write(
+        repo.dir.join("Dockerfile"),
+        include_str!("Dockerfile-debian"),
+    )
+    .expect("Failed to write Dockerfile");
+
+    run_git(&repo.dir, &["add", "Dockerfile"]);
+    run_git(&repo.dir, &["commit", "-m", "Add Dockerfile"]);
+
+    let sandbox_name = "test-agent-websearch";
+
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("sandbox"))
+        .current_dir(&repo.dir)
+        .args([
+            "agent",
+            sandbox_name,
+            "--runtime",
+            "runc",
+            "--model",
+            "haiku",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn agent");
+
+    let stdin = child.stdin.as_mut().expect("Failed to open stdin");
+    writeln!(
+        stdin,
+        "When was the last US penny minted? Answer with just the date in yyyy-mm-dd format."
+    )
+    .expect("Failed to write to stdin");
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("Failed to wait for agent");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("2025-11-12"),
+        "Agent should find the last US penny minting date via web search.\nstdout: {}\nstderr: {}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = run_sandbox_in(&repo.dir, &["delete", sandbox_name]);
+    assert!(
+        output.status.success(),
+        "Failed to delete sandbox: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
