@@ -7,6 +7,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempPath;
 
@@ -246,6 +247,101 @@ fn log(file: &mut std::fs::File, message: &str) {
     let _ = writeln!(file, "[{}] {}", timestamp, message);
 }
 
+fn run_git_sync_thread(info: SandboxInfo, log_path: PathBuf) {
+    let mut log_file = match OpenOptions::new().create(true).append(true).open(&log_path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    let debounce = Duration::from_millis(500);
+    let main_sync_interval = Duration::from_secs(30);
+    let mut last_sync = Instant::now();
+    let mut last_main_sync = Instant::now();
+    let mut pending_sync = false;
+
+    let (tx, rx) = mpsc::channel();
+    let mut watcher = match RecommendedWatcher::new(
+        move |res| {
+            let _ = tx.send(res);
+        },
+        Config::default().with_poll_interval(Duration::from_secs(1)),
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            log(&mut log_file, &format!("Failed to create watcher: {}", e));
+            return;
+        }
+    };
+
+    let sandbox_git = info.clone_dir.join(".git");
+    if sandbox_git.exists() {
+        if let Err(e) = watcher.watch(&sandbox_git, RecursiveMode::Recursive) {
+            log(
+                &mut log_file,
+                &format!("Failed to watch {}: {}", sandbox_git.display(), e),
+            );
+            return;
+        }
+        log(
+            &mut log_file,
+            &format!("Git sync thread watching: {}", sandbox_git.display()),
+        );
+    } else {
+        log(
+            &mut log_file,
+            &format!("No .git directory found at {}", sandbox_git.display()),
+        );
+        return;
+    }
+
+    loop {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(event)) => {
+                if !event.kind.is_access() {
+                    pending_sync = true;
+                }
+            }
+            Ok(Err(e)) => {
+                log(&mut log_file, &format!("Watcher error: {}", e));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                log(&mut log_file, "Git sync watcher channel disconnected");
+                return;
+            }
+        }
+
+        let now = Instant::now();
+
+        if pending_sync && now.duration_since(last_sync) > debounce {
+            if let Err(e) =
+                git::sync_sandbox_to_meta(&info.meta_git_dir, &info.clone_dir, &info.name)
+            {
+                log(
+                    &mut log_file,
+                    &format!("Error syncing sandbox to meta.git: {}", e),
+                );
+            } else if let Err(e) =
+                git::sync_meta_to_host(&info.repo_root, &info.meta_git_dir, &info.name)
+            {
+                log(
+                    &mut log_file,
+                    &format!("Error syncing meta.git to host: {}", e),
+                );
+            }
+            last_sync = now;
+            pending_sync = false;
+        }
+
+        if now.duration_since(last_main_sync) > main_sync_interval {
+            if let Err(e) = git::sync_main_to_meta(&info.repo_root, &info.meta_git_dir) {
+                log(&mut log_file, &format!("Error syncing main branch: {}", e));
+            }
+            last_main_sync = now;
+        }
+    }
+}
+
 pub fn run_daemon_with_sync(
     info: &SandboxInfo,
     image_tag: &str,
@@ -293,16 +389,6 @@ pub fn run_daemon_with_sync(
     let start = Instant::now();
     let mut container_started = false;
 
-    // Git sync state
-    let (tx, rx) = mpsc::channel();
-    // Watcher is stored here to keep it alive for the duration of the loop
-    let mut _watcher: Option<RecommendedWatcher> = None;
-    let debounce = Duration::from_millis(500);
-    let main_sync_interval = Duration::from_secs(30);
-    let mut last_sync = Instant::now();
-    let mut last_main_sync = Instant::now();
-    let mut pending_sync = false;
-
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
@@ -347,23 +433,12 @@ pub fn run_daemon_with_sync(
                                     }
                                 }
 
-                                let tx_clone = tx.clone();
-                                let mut watcher = RecommendedWatcher::new(
-                                    move |res| {
-                                        let _ = tx_clone.send(res);
-                                    },
-                                    Config::default().with_poll_interval(Duration::from_secs(1)),
-                                )?;
-
-                                let sandbox_git = info.clone_dir.join(".git");
-                                if sandbox_git.exists() {
-                                    watcher.watch(&sandbox_git, RecursiveMode::Recursive)?;
-                                    log(
-                                        &mut log_file,
-                                        &format!("Watching: {}", sandbox_git.display()),
-                                    );
-                                }
-                                _watcher = Some(watcher);
+                                // Spawn git sync thread
+                                let sync_info = info.clone();
+                                let sync_log_path = log_path.clone();
+                                thread::spawn(move || {
+                                    run_git_sync_thread(sync_info, sync_log_path);
+                                });
                             }
                             Err(e) => {
                                 log(&mut log_file, &format!("Failed to start container: {}", e));
@@ -406,52 +481,6 @@ pub fn run_daemon_with_sync(
             );
             cleanup_socket(&sock_path);
             return Ok(());
-        }
-
-        if container_started {
-            match rx.try_recv() {
-                Ok(Ok(event)) => {
-                    if !event.kind.is_access() {
-                        pending_sync = true;
-                    }
-                }
-                Ok(Err(e)) => {
-                    log(&mut log_file, &format!("Watcher error: {}", e));
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    log(&mut log_file, "Watcher channel disconnected");
-                }
-            }
-
-            let now = Instant::now();
-
-            if pending_sync && now.duration_since(last_sync) > debounce {
-                if let Err(e) =
-                    git::sync_sandbox_to_meta(&info.meta_git_dir, &info.clone_dir, &info.name)
-                {
-                    log(
-                        &mut log_file,
-                        &format!("Error syncing sandbox to meta.git: {}", e),
-                    );
-                } else if let Err(e) =
-                    git::sync_meta_to_host(&info.repo_root, &info.meta_git_dir, &info.name)
-                {
-                    log(
-                        &mut log_file,
-                        &format!("Error syncing meta.git to host: {}", e),
-                    );
-                }
-                last_sync = now;
-                pending_sync = false;
-            }
-
-            if now.duration_since(last_main_sync) > main_sync_interval {
-                if let Err(e) = git::sync_main_to_meta(&info.repo_root, &info.meta_git_dir) {
-                    log(&mut log_file, &format!("Error syncing main branch: {}", e));
-                }
-                last_main_sync = now;
-            }
         }
 
         std::thread::sleep(Duration::from_millis(100));
