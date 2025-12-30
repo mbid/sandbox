@@ -27,7 +27,7 @@ impl TestRepo {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let random: u64 = rand::thread_rng().gen();
+        let random: u64 = rand::rng().random();
         let dir = PathBuf::from(format!("/tmp/sandbox-test-{}-{:016x}", timestamp, random));
         fs::create_dir_all(&dir).expect("Failed to create temp directory");
 

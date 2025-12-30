@@ -12,28 +12,28 @@ name = "sandbox"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0"
-log = "0.4"
-env_logger = "0.11"
-clap = { version = "4.4", features = ["derive"] }
-sha2 = "0.10"
-hex = "0.4"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", features = ["preserve_order"] }
-notify = "6.1"
-tokio = { version = "1.35", features = ["full"] }
-dirs = "5.0"
-nix = { version = "0.27", features = ["user", "fs"] }
-chrono = { version = "0.4", features = ["serde"] }
-libc = "0.2"
-reflink-copy = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-indoc = { version = ">= 0" }
-strum = { version = "0.27.2", features = ["derive"] }
-backoff = "0.4"
-rand = "0.8"
-tempfile = "3"
+anyhow = "*"
+log = "*"
+env_logger = "*"
+clap = { version = "*", features = ["derive"] }
+sha2 = "*"
+hex = "*"
+serde = { version = "*", features = ["derive"] }
+serde_json = { version = "*", features = ["preserve_order"] }
+notify = "*"
+tokio = { version = "*", features = ["full"] }
+dirs = "*"
+nix = { version = "*", features = ["user", "fs"] }
+chrono = { version = "*", features = ["serde"] }
+libc = "*"
+reflink-copy = "*"
+reqwest = { version = "*", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+indoc = "*"
+strum = { version = "*", features = ["derive"] }
+backoff = "*"
+rand = "*"
+tempfile = "*"
 
 [dev-dependencies]
-assert_cmd = "2.0"
-portable-pty = "0.8"
+assert_cmd = "*"
+portable-pty = "*"

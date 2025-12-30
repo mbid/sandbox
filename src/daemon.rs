@@ -1,11 +1,10 @@
 use anyhow::{bail, Context, Result};
 use backoff::{backoff::Backoff, ExponentialBackoff};
 use log::{debug, error, info};
-use nix::fcntl::{flock, FlockArg};
+use nix::fcntl::{Flock, FlockArg};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -34,16 +33,8 @@ fn lockfile_path(info: &SandboxInfo) -> PathBuf {
     info.sandbox_dir.join("daemon.lock")
 }
 
-/// A file lock that releases when dropped.
-struct FileLock {
-    file: File,
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        let _ = flock(self.file.as_raw_fd(), FlockArg::Unlock);
-    }
-}
+/// A file lock that releases when dropped (wrapper around nix::fcntl::Flock).
+type FileLock = Flock<File>;
 
 fn try_acquire_lock(lock_path: &Path) -> Result<Option<FileLock>> {
     std::fs::create_dir_all(lock_path.parent().unwrap())?;
@@ -55,10 +46,10 @@ fn try_acquire_lock(lock_path: &Path) -> Result<Option<FileLock>> {
         .open(lock_path)
         .with_context(|| format!("Failed to open lock file: {}", lock_path.display()))?;
 
-    match flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
-        Ok(()) => Ok(Some(FileLock { file })),
-        Err(nix::errno::Errno::EWOULDBLOCK) => Ok(None),
-        Err(e) => Err(e).context("Failed to acquire lock"),
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => Ok(Some(lock)),
+        Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(None),
+        Err((_, e)) => Err(e).context("Failed to acquire lock"),
     }
 }
 

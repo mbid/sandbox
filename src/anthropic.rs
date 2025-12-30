@@ -360,7 +360,7 @@ impl Client {
                 } else if attempt == 1 && !is_rate_limited {
                     Duration::ZERO
                 } else {
-                    let jitter = rand::thread_rng().gen_range(Duration::ZERO..MAX_JITTER);
+                    let jitter = rand::rng().random_range(Duration::ZERO..MAX_JITTER);
                     BASE_RETRY_DELAY + jitter
                 };
 
