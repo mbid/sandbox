@@ -1,5 +1,7 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use env_logger::Builder;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
 use crate::agent;
@@ -98,8 +100,6 @@ pub enum Commands {
     },
 }
 
-/// Resolve environment variable names to their values.
-/// Returns an error if any variable is not set.
 fn resolve_env_vars(var_names: &[String]) -> Result<Vec<(String, String)>> {
     var_names
         .iter()
@@ -111,8 +111,32 @@ fn resolve_env_vars(var_names: &[String]) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
+fn init_logging(command: &Commands) -> Result<()> {
+    match command {
+        Commands::Enter { .. }
+        | Commands::List
+        | Commands::Delete { .. }
+        | Commands::Agent { .. } => {
+            env_logger::init();
+        }
+        Commands::InternalDaemon { sandbox_dir, .. } => {
+            let log_path = sandbox_dir.join("daemon.log");
+            let log_file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .with_context(|| format!("Failed to open log file: {}", log_path.display()))?;
+            Builder::from_env(env_logger::Env::default())
+                .target(env_logger::Target::Pipe(Box::new(log_file)))
+                .init();
+        }
+    }
+    Ok(())
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    init_logging(&cli.command)?;
 
     match cli.command {
         Commands::InternalDaemon {

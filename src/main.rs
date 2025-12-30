@@ -1,8 +1,6 @@
 use std::{env, process::ExitCode};
 
 fn main() -> ExitCode {
-    env_logger::init();
-
     match sandbox::run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

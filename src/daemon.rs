@@ -1,15 +1,17 @@
 use anyhow::{bail, Context, Result};
-use log::debug;
+use backoff::{backoff::Backoff, ExponentialBackoff};
+use log::{debug, error, info};
+use nix::fcntl::{flock, FlockArg};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
-use std::fs::OpenOptions;
+use std::fs::File;
 use std::io::{Read, Write};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-use tempfile::TempPath;
 
 use crate::config::{OverlayMode, Runtime, UserInfo};
 use crate::docker;
@@ -28,40 +30,36 @@ fn socket_path(info: &SandboxInfo) -> PathBuf {
     PathBuf::from(format!("/tmp/sandbox/{}.sock", hash))
 }
 
-fn bind_socket(sock_path: &Path, log_file: &mut std::fs::File) -> Result<UnixListener> {
-    let scratch_dir = Path::new("/tmp/sandbox/scratch");
-    std::fs::create_dir_all(scratch_dir).context("Failed to create scratch directory")?;
+fn lockfile_path(info: &SandboxInfo) -> PathBuf {
+    info.sandbox_dir.join("daemon.lock")
+}
 
-    let sock_parent = sock_path.parent().unwrap();
-    std::fs::create_dir_all(sock_parent).with_context(|| {
-        format!(
-            "Failed to create socket directory: {}",
-            sock_parent.display()
-        )
-    })?;
+/// A file lock that releases when dropped.
+struct FileLock {
+    file: File,
+}
 
-    let random_id: u64 = rand::random();
-    let temp_path = scratch_dir.join(format!("{:016x}.sock", random_id));
-
-    let listener = UnixListener::bind(&temp_path)
-        .with_context(|| format!("Failed to bind socket at {}", temp_path.display()))?;
-
-    let _temp_path = TempPath::from_path(&temp_path);
-
-    // Atomically publish the socket via hard link
-    match std::fs::hard_link(&temp_path, sock_path) {
-        Ok(()) => Ok(listener),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            log(log_file, "Another daemon already running, exiting");
-            Err(e).context("Another daemon is already running")
-        }
-        Err(e) => Err(e).context("Failed to publish socket"),
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = flock(self.file.as_raw_fd(), FlockArg::Unlock);
     }
 }
 
-fn cleanup_socket(sock_path: &Path) {
-    // TODO: Use flock for truly graceful cleanup
-    let _ = std::fs::remove_file(sock_path);
+fn try_acquire_lock(lock_path: &Path) -> Result<Option<FileLock>> {
+    std::fs::create_dir_all(lock_path.parent().unwrap())?;
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .with_context(|| format!("Failed to open lock file: {}", lock_path.display()))?;
+
+    match flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
+        Ok(()) => Ok(Some(FileLock { file })),
+        Err(nix::errno::Errno::EWOULDBLOCK) => Ok(None),
+        Err(e) => Err(e).context("Failed to acquire lock"),
+    }
 }
 
 fn start_container(
@@ -121,27 +119,27 @@ pub fn connect_or_launch(
     env_vars: &[(String, String)],
 ) -> Result<DaemonConnection> {
     let sock_path = socket_path(info);
+    let lock_path = lockfile_path(info);
 
+    // Try to connect to existing socket
     if sock_path.exists() {
-        let stream = UnixStream::connect(&sock_path).with_context(|| {
-            format!(
-                "Socket exists at {} but cannot connect",
-                sock_path.display()
-            )
-        })?;
-        debug!("Connected to existing daemon");
-        let mut conn = DaemonConnection { stream };
-        conn.wait_for_ready()?;
-        return Ok(conn);
+        match UnixStream::connect(&sock_path) {
+            Ok(stream) => {
+                debug!("Connected to existing daemon");
+                let mut conn = DaemonConnection { stream };
+                conn.wait_for_ready()?;
+                return Ok(conn);
+            }
+            Err(_) => {}
+        }
     }
 
+    // Spawn a new daemon (it will handle lock acquisition with backoff)
     debug!("Launching daemon...");
     spawn_daemon(info, image_tag, user_info, runtime, overlay_mode, env_vars)?;
 
-    wait_for_socket(&sock_path)?;
-
-    let stream =
-        UnixStream::connect(&sock_path).context("Failed to connect to daemon after launch")?;
+    // Wait for socket to become connectable (not just exist)
+    let stream = wait_for_socket_connectable(&sock_path, &lock_path)?;
     let mut conn = DaemonConnection { stream };
     conn.wait_for_ready()?;
 
@@ -185,74 +183,38 @@ fn spawn_daemon(
     Ok(())
 }
 
-fn wait_for_socket(sock_path: &Path) -> Result<()> {
-    if sock_path.exists() {
-        return Ok(());
-    }
-
+/// Wait for a socket to become connectable. This handles the case where another daemon
+/// is shutting down (holding the lock) and a new daemon will take over.
+fn wait_for_socket_connectable(sock_path: &Path, lock_path: &Path) -> Result<UnixStream> {
     let timeout = Duration::from_secs(30);
     let start = Instant::now();
-
-    let parent = sock_path
-        .parent()
-        .context("Socket path has no parent directory")?;
-
-    // Daemon might not have created it yet
-    if !parent.exists() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create socket directory: {}", parent.display()))?;
-    }
-
-    let (tx, rx) = mpsc::channel();
-    let mut watcher = RecommendedWatcher::new(
-        move |res| {
-            let _ = tx.send(res);
-        },
-        Config::default(),
-    )?;
-    watcher.watch(parent, RecursiveMode::NonRecursive)?;
-
-    // File may have appeared between initial check and watch setup
-    if sock_path.exists() {
-        return Ok(());
-    }
+    let poll_interval = Duration::from_millis(50);
 
     loop {
         let remaining = timeout.saturating_sub(start.elapsed());
         if remaining.is_zero() {
-            bail!("Timeout waiting for daemon socket");
+            bail!("Timeout waiting for daemon socket to become connectable");
         }
 
-        match rx.recv_timeout(remaining) {
-            Ok(Ok(_event)) => {
-                if sock_path.exists() {
-                    return Ok(());
-                }
+        // Try to connect
+        if sock_path.exists() {
+            if let Ok(stream) = UnixStream::connect(sock_path) {
+                return Ok(stream);
             }
-            Ok(Err(e)) => {
-                bail!("File watcher error: {}", e);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                bail!("Timeout waiting for daemon socket");
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                bail!("File watcher disconnected");
+            // Socket exists but not connectable - maybe orphaned.
+            // Try to clean it up if we can get the lock.
+            if let Ok(Some(lock)) = try_acquire_lock(lock_path) {
+                debug!("Acquired lock while waiting, removing orphaned socket");
+                let _ = std::fs::remove_file(sock_path);
+                drop(lock);
             }
         }
+
+        std::thread::sleep(poll_interval.min(remaining));
     }
 }
 
-fn log(file: &mut std::fs::File, message: &str) {
-    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    let _ = writeln!(file, "[{}] {}", timestamp, message);
-}
-
-fn run_git_sync_thread(info: SandboxInfo, log_path: PathBuf) {
-    let mut log_file = match OpenOptions::new().create(true).append(true).open(&log_path) {
-        Ok(f) => f,
-        Err(_) => return,
-    };
-
+fn run_git_sync_thread(info: SandboxInfo) {
     let debounce = Duration::from_millis(500);
     let main_sync_interval = Duration::from_secs(30);
     let mut last_sync = Instant::now();
@@ -268,7 +230,7 @@ fn run_git_sync_thread(info: SandboxInfo, log_path: PathBuf) {
     ) {
         Ok(w) => w,
         Err(e) => {
-            log(&mut log_file, &format!("Failed to create watcher: {}", e));
+            error!("Failed to create watcher: {}", e);
             return;
         }
     };
@@ -276,21 +238,12 @@ fn run_git_sync_thread(info: SandboxInfo, log_path: PathBuf) {
     let sandbox_git = info.clone_dir.join(".git");
     if sandbox_git.exists() {
         if let Err(e) = watcher.watch(&sandbox_git, RecursiveMode::Recursive) {
-            log(
-                &mut log_file,
-                &format!("Failed to watch {}: {}", sandbox_git.display(), e),
-            );
+            error!("Failed to watch {}: {}", sandbox_git.display(), e);
             return;
         }
-        log(
-            &mut log_file,
-            &format!("Git sync thread watching: {}", sandbox_git.display()),
-        );
+        info!("Git sync thread watching: {}", sandbox_git.display());
     } else {
-        log(
-            &mut log_file,
-            &format!("No .git directory found at {}", sandbox_git.display()),
-        );
+        info!("No .git directory found at {}", sandbox_git.display());
         return;
     }
 
@@ -302,11 +255,11 @@ fn run_git_sync_thread(info: SandboxInfo, log_path: PathBuf) {
                 }
             }
             Ok(Err(e)) => {
-                log(&mut log_file, &format!("Watcher error: {}", e));
+                error!("Watcher error: {}", e);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                log(&mut log_file, "Git sync watcher channel disconnected");
+                info!("Git sync watcher channel disconnected");
                 return;
             }
         }
@@ -317,17 +270,11 @@ fn run_git_sync_thread(info: SandboxInfo, log_path: PathBuf) {
             if let Err(e) =
                 git::sync_sandbox_to_meta(&info.meta_git_dir, &info.clone_dir, &info.name)
             {
-                log(
-                    &mut log_file,
-                    &format!("Error syncing sandbox to meta.git: {}", e),
-                );
+                error!("Error syncing sandbox to meta.git: {}", e);
             } else if let Err(e) =
                 git::sync_meta_to_host(&info.repo_root, &info.meta_git_dir, &info.name)
             {
-                log(
-                    &mut log_file,
-                    &format!("Error syncing meta.git to host: {}", e),
-                );
+                error!("Error syncing meta.git to host: {}", e);
             }
             last_sync = now;
             pending_sync = false;
@@ -335,11 +282,68 @@ fn run_git_sync_thread(info: SandboxInfo, log_path: PathBuf) {
 
         if now.duration_since(last_main_sync) > main_sync_interval {
             if let Err(e) = git::sync_main_to_meta(&info.repo_root, &info.meta_git_dir) {
-                log(&mut log_file, &format!("Error syncing main branch: {}", e));
+                error!("Error syncing main branch: {}", e);
             }
             last_main_sync = now;
         }
     }
+}
+
+fn acquire_lock_with_backoff(lock_path: &Path) -> Result<FileLock> {
+    let mut backoff = ExponentialBackoff {
+        initial_interval: Duration::from_millis(10),
+        max_interval: Duration::from_secs(1),
+        max_elapsed_time: Some(Duration::from_secs(30)),
+        ..ExponentialBackoff::default()
+    };
+
+    loop {
+        match try_acquire_lock(lock_path)? {
+            Some(lock) => return Ok(lock),
+            None => match backoff.next_backoff() {
+                Some(duration) => {
+                    info!("Lock held by another daemon, retrying in {:?}", duration);
+                    std::thread::sleep(duration);
+                }
+                None => {
+                    bail!("Timeout acquiring daemon lock after 30 seconds");
+                }
+            },
+        }
+    }
+}
+
+fn bind_socket(sock_path: &Path) -> Result<UnixListener> {
+    let scratch_dir = Path::new("/tmp/sandbox/scratch");
+    std::fs::create_dir_all(scratch_dir).context("Failed to create scratch directory")?;
+
+    let sock_parent = sock_path.parent().unwrap();
+    std::fs::create_dir_all(sock_parent).with_context(|| {
+        format!(
+            "Failed to create socket directory: {}",
+            sock_parent.display()
+        )
+    })?;
+
+    let random_id: u64 = rand::random();
+    let temp_path = scratch_dir.join(format!("{:016x}.sock", random_id));
+
+    let listener = UnixListener::bind(&temp_path)
+        .with_context(|| format!("Failed to bind socket at {}", temp_path.display()))?;
+
+    // Remove any existing socket (must be orphaned since we hold the lock)
+    let _ = std::fs::remove_file(sock_path);
+
+    // Move socket to final location
+    std::fs::rename(&temp_path, sock_path).with_context(|| {
+        format!(
+            "Failed to move socket from {} to {}",
+            temp_path.display(),
+            sock_path.display()
+        )
+    })?;
+
+    Ok(listener)
 }
 
 pub fn run_daemon_with_sync(
@@ -350,39 +354,36 @@ pub fn run_daemon_with_sync(
     overlay_mode: OverlayMode,
     env_vars: &[(String, String)],
 ) -> Result<()> {
-    let log_path = info.sandbox_dir.join("daemon.log");
-    let mut log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("Failed to open log file: {}", log_path.display()))?;
+    info!("Daemon starting for sandbox '{}'", info.name);
 
-    log(
-        &mut log_file,
-        &format!("Daemon starting for sandbox '{}'", info.name),
-    );
-
+    let lock_path = lockfile_path(info);
     let sock_path = socket_path(info);
 
-    let listener = match bind_socket(&sock_path, &mut log_file) {
+    let lock = match acquire_lock_with_backoff(&lock_path) {
         Ok(l) => l,
         Err(e) => {
-            log(&mut log_file, &format!("Failed to bind socket: {}", e));
+            error!("Failed to acquire lock: {}", e);
+            return Err(e);
+        }
+    };
+
+    info!("Acquired daemon lock");
+
+    let listener = match bind_socket(&sock_path) {
+        Ok(l) => l,
+        Err(e) => {
+            error!("Failed to bind socket: {}", e);
+            drop(lock);
             return Err(e);
         }
     };
     if let Err(e) = listener.set_nonblocking(true) {
-        log(
-            &mut log_file,
-            &format!("Failed to set socket non-blocking: {}", e),
-        );
+        error!("Failed to set socket non-blocking: {}", e);
+        drop(lock);
         return Err(e.into());
     }
 
-    log(
-        &mut log_file,
-        &format!("Listening on {}", sock_path.display()),
-    );
+    info!("Listening on {}", sock_path.display());
 
     let mut clients: Vec<UnixStream> = Vec::new();
     let mut pending_clients: Vec<UnixStream> = Vec::new();
@@ -392,12 +393,9 @@ pub fn run_daemon_with_sync(
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                log(
-                    &mut log_file,
-                    &format!(
-                        "Client connected (total: {})",
-                        clients.len() + pending_clients.len() + 1
-                    ),
+                info!(
+                    "Client connected (total: {})",
+                    clients.len() + pending_clients.len() + 1
                 );
 
                 if container_started {
@@ -410,10 +408,7 @@ pub fn run_daemon_with_sync(
                     pending_clients.push(stream);
 
                     if is_first {
-                        log(
-                            &mut log_file,
-                            "First client connected, starting container...",
-                        );
+                        info!("First client connected, starting container...");
                         match start_container(
                             info,
                             image_tag,
@@ -424,7 +419,7 @@ pub fn run_daemon_with_sync(
                         ) {
                             Ok(()) => {
                                 container_started = true;
-                                log(&mut log_file, "Container started successfully");
+                                info!("Container started successfully");
 
                                 for mut client in pending_clients.drain(..) {
                                     if client.write_all(&[0u8]).is_ok() {
@@ -433,16 +428,15 @@ pub fn run_daemon_with_sync(
                                     }
                                 }
 
-                                // Spawn git sync thread
                                 let sync_info = info.clone();
-                                let sync_log_path = log_path.clone();
                                 thread::spawn(move || {
-                                    run_git_sync_thread(sync_info, sync_log_path);
+                                    run_git_sync_thread(sync_info);
                                 });
                             }
                             Err(e) => {
-                                log(&mut log_file, &format!("Failed to start container: {}", e));
-                                cleanup_socket(&sock_path);
+                                error!("Failed to start container: {}", e);
+                                drop(listener);
+                                drop(lock);
                                 return Err(e);
                             }
                         }
@@ -451,7 +445,7 @@ pub fn run_daemon_with_sync(
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => {
-                log(&mut log_file, &format!("Accept error: {}", e));
+                error!("Accept error: {}", e);
             }
         }
 
@@ -466,7 +460,7 @@ pub fn run_daemon_with_sync(
         });
 
         if container_started && clients.is_empty() && pending_clients.is_empty() {
-            log(&mut log_file, "All clients disconnected, shutting down...");
+            info!("All clients disconnected, shutting down...");
             break;
         }
 
@@ -475,38 +469,31 @@ pub fn run_daemon_with_sync(
             && pending_clients.is_empty()
             && start.elapsed() > FIRST_CLIENT_TIMEOUT
         {
-            log(
-                &mut log_file,
-                "No clients connected within timeout, shutting down...",
-            );
-            cleanup_socket(&sock_path);
+            info!("No clients connected within timeout, shutting down...");
+            drop(listener);
+            drop(lock);
             return Ok(());
         }
 
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // Remove socket immediately so new clients can start a fresh daemon
-    cleanup_socket(&sock_path);
+    drop(listener);
 
-    log(&mut log_file, "Running final sync before shutdown...");
+    info!("Running final sync before shutdown...");
     if let Err(e) = git::sync_sandbox_to_meta(&info.meta_git_dir, &info.clone_dir, &info.name) {
-        log(
-            &mut log_file,
-            &format!("Error in final sandbox sync: {}", e),
-        );
+        error!("Error in final sandbox sync: {}", e);
     } else if let Err(e) = git::sync_meta_to_host(&info.repo_root, &info.meta_git_dir, &info.name) {
-        log(
-            &mut log_file,
-            &format!("Error in final meta-to-host sync: {}", e),
-        );
+        error!("Error in final meta-to-host sync: {}", e);
     }
 
-    log(&mut log_file, "Stopping container...");
+    info!("Stopping container...");
     if let Err(e) = docker::stop_container(&info.container_name) {
-        log(&mut log_file, &format!("Error stopping container: {}", e));
+        error!("Error stopping container: {}", e);
     }
 
-    log(&mut log_file, "Daemon exiting");
+    drop(lock);
+
+    info!("Daemon exiting");
     Ok(())
 }
