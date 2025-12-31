@@ -476,6 +476,7 @@ fn test_agent_reads_file() {
 
     let sandbox_name = "test-agent";
 
+    let cache_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("llm-cache");
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("sandbox"))
         .current_dir(&repo.dir)
         .args([
@@ -485,6 +486,8 @@ fn test_agent_reads_file() {
             "runc",
             "--model",
             "haiku",
+            "--cache",
+            cache_dir.to_str().unwrap(),
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -493,7 +496,7 @@ fn test_agent_reads_file() {
         .expect("Failed to spawn agent");
 
     let stdin = child.stdin.as_mut().expect("Failed to open stdin");
-    writeln!(stdin, "What is the content of the file secret.txt?")
+    writeln!(stdin, "Run `cat secret.txt` and tell me what it contains.")
         .expect("Failed to write to stdin");
     drop(child.stdin.take());
 
@@ -534,6 +537,7 @@ fn test_agent_edits_file() {
 
     let sandbox_name = "test-agent-edit";
 
+    let cache_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("llm-cache");
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("sandbox"))
         .current_dir(&repo.dir)
         .args([
@@ -543,6 +547,8 @@ fn test_agent_edits_file() {
             "runc",
             "--model",
             "haiku",
+            "--cache",
+            cache_dir.to_str().unwrap(),
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -553,7 +559,7 @@ fn test_agent_edits_file() {
     let stdin = child.stdin.as_mut().expect("Failed to open stdin");
     writeln!(
         stdin,
-        "Edit the file greeting.txt to replace 'World' with 'Universe'. Then read the file and tell me its new content."
+        "Run `sed -i 's/World/Universe/' greeting.txt` then run `cat greeting.txt` and tell me the result."
     )
     .expect("Failed to write to stdin");
     drop(child.stdin.take());
@@ -592,6 +598,7 @@ fn test_agent_writes_file() {
     let sandbox_name = "test-agent-write";
     let expected_content = "WRITTEN_BY_AGENT_12345";
 
+    let cache_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("llm-cache");
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("sandbox"))
         .current_dir(&repo.dir)
         .args([
@@ -601,6 +608,8 @@ fn test_agent_writes_file() {
             "runc",
             "--model",
             "haiku",
+            "--cache",
+            cache_dir.to_str().unwrap(),
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -611,7 +620,7 @@ fn test_agent_writes_file() {
     let stdin = child.stdin.as_mut().expect("Failed to open stdin");
     writeln!(
         stdin,
-        "Create a new file called newfile.txt with the content '{}'. Then read it back to confirm.",
+        "Run `echo '{}' > newfile.txt` then run `cat newfile.txt` and tell me the result.",
         expected_content
     )
     .expect("Failed to write to stdin");
@@ -774,6 +783,7 @@ fn test_agent_handles_command_with_empty_output_and_nonzero_exit() {
 
     let sandbox_name = "test-agent-empty-error";
 
+    let cache_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("llm-cache");
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("sandbox"))
         .current_dir(&repo.dir)
         .args([
@@ -783,6 +793,8 @@ fn test_agent_handles_command_with_empty_output_and_nonzero_exit() {
             "runc",
             "--model",
             "haiku",
+            "--cache",
+            cache_dir.to_str().unwrap(),
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -837,6 +849,7 @@ fn test_agent_large_file_output() {
 
     let sandbox_name = "test-agent-large-file";
 
+    let cache_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("llm-cache");
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("sandbox"))
         .current_dir(&repo.dir)
         .args([
@@ -846,6 +859,8 @@ fn test_agent_large_file_output() {
             "runc",
             "--model",
             "haiku",
+            "--cache",
+            cache_dir.to_str().unwrap(),
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -920,7 +935,7 @@ fi
 
 # First invocation: append the test message
 echo "" >> "$FILE"
-echo "What is the content of the file secret.txt?" >> "$FILE"
+echo "Run \`cat secret.txt\` and tell me what it contains." >> "$FILE"
 
 # Create marker for next invocation
 touch "$MARKER"
@@ -955,6 +970,7 @@ touch "$MARKER"
         .expect("Failed to open PTY");
 
     // Build command to spawn via PTY
+    let cache_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("llm-cache");
     let sandbox_bin = assert_cmd::cargo::cargo_bin!("sandbox");
     let mut cmd = CommandBuilder::new(&sandbox_bin);
     cmd.cwd(&repo.dir);
@@ -966,6 +982,8 @@ touch "$MARKER"
         "runc",
         "--model",
         "haiku",
+        "--cache",
+        cache_dir.to_str().unwrap(),
     ]);
 
     // Spawn the agent process in the PTY
@@ -1039,7 +1057,7 @@ touch "$MARKER"
 
     // Verify the user message was recorded in output (shows vim input worked)
     assert!(
-        output.contains("> What is the content of the file secret.txt?"),
+        output.contains("> Run `cat secret.txt` and tell me what it contains."),
         "Agent output should show the user message from vim.\noutput: {}",
         output
     );
@@ -1070,6 +1088,7 @@ fn test_agent_websearch() {
 
     let sandbox_name = "test-agent-websearch";
 
+    let cache_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("llm-cache");
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("sandbox"))
         .current_dir(&repo.dir)
         .args([
@@ -1079,6 +1098,8 @@ fn test_agent_websearch() {
             "runc",
             "--model",
             "haiku",
+            "--cache",
+            cache_dir.to_str().unwrap(),
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

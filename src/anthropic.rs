@@ -335,14 +335,18 @@ impl Client {
     }
 
     /// Build request headers for the messages endpoint.
-    fn build_headers(&self) -> Vec<(&'static str, String)> {
+    /// Build headers for the API request. If `for_cache_key` is true, excludes the API key
+    /// so cache lookups work regardless of whether an API key is set.
+    fn build_headers(&self, for_cache_key: bool) -> Vec<(&'static str, String)> {
         let mut headers = vec![
             ("anthropic-version", ANTHROPIC_VERSION.to_string()),
             ("anthropic-beta", "web-fetch-2025-09-10".to_string()),
             ("content-type", "application/json".to_string()),
         ];
-        if let Some(ref api_key) = self.api_key {
-            headers.push(("x-api-key", api_key.clone()));
+        if !for_cache_key {
+            if let Some(ref api_key) = self.api_key {
+                headers.push(("x-api-key", api_key.clone()));
+            }
         }
         headers
     }
@@ -357,14 +361,16 @@ impl Client {
         // Serialize request body to a string once
         let body = serde_json::to_string(&request).context("Failed to serialize request")?;
 
-        // Build headers for cache key computation
-        let headers = self.build_headers();
-        let header_refs: Vec<(&str, &str)> =
-            headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        // Build headers for cache key computation (excludes API key for consistent cache lookups)
+        let cache_headers = self.build_headers(true);
+        let cache_header_refs: Vec<(&str, &str)> = cache_headers
+            .iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect();
 
         // Check cache first
         if let Some(ref cache) = self.cache {
-            let cache_key = cache.compute_key(&header_refs, &body);
+            let cache_key = cache.compute_key(&cache_header_refs, &body);
             if let Some(cached_response) = cache.get(&cache_key) {
                 let response: MessagesResponse = serde_json::from_str(&cached_response)
                     .context("Failed to parse cached response")?;
@@ -377,12 +383,15 @@ impl Client {
             anyhow::bail!("Cache miss and no ANTHROPIC_API_KEY set - cannot make API request");
         }
 
+        // Build headers including API key for actual requests
+        let request_headers = self.build_headers(false);
+
         let mut attempt = 0;
 
         loop {
             let mut req = self.client.post(ANTHROPIC_API_URL).body(body.clone());
 
-            for (name, value) in &headers {
+            for (name, value) in &request_headers {
                 req = req.header(*name, value);
             }
 
@@ -415,7 +424,7 @@ impl Client {
                 let response_text = response.text().context("Failed to read response body")?;
 
                 if let Some(ref cache) = self.cache {
-                    let cache_key = cache.compute_key(&header_refs, &body);
+                    let cache_key = cache.compute_key(&cache_header_refs, &body);
                     cache.put(&cache_key, &response_text)?;
                 }
 
