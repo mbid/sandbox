@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use log::{debug, warn};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -389,6 +390,7 @@ impl Client {
         let mut attempt = 0;
 
         loop {
+            debug!("Sending API request (attempt {})", attempt + 1);
             let mut req = self.client.post(ANTHROPIC_API_URL).body(body.clone());
 
             for (name, value) in &request_headers {
@@ -396,8 +398,12 @@ impl Client {
             }
 
             let response = match req.send() {
-                Ok(response) => response,
+                Ok(response) => {
+                    debug!("API response received");
+                    response
+                }
                 Err(e) => {
+                    warn!("API request failed: {} (timeout={})", e, e.is_timeout());
                     // Only retry on timeout errors, fail immediately on other errors
                     if e.is_timeout() && attempt < MAX_RETRIES {
                         attempt += 1;
@@ -409,6 +415,7 @@ impl Client {
                             BASE_RETRY_DELAY + jitter
                         };
 
+                        warn!("Retrying after {:?}", delay);
                         if !delay.is_zero() {
                             std::thread::sleep(delay);
                         }
@@ -419,6 +426,7 @@ impl Client {
             };
 
             let status = response.status();
+            debug!("API response status: {}", status);
 
             if status.is_success() {
                 let response_text = response.text().context("Failed to read response body")?;
@@ -430,6 +438,10 @@ impl Client {
 
                 let response: MessagesResponse = serde_json::from_str(&response_text)
                     .context("Failed to parse Anthropic API response")?;
+                debug!(
+                    "API request successful: {} input tokens, {} output tokens",
+                    response.usage.input_tokens, response.usage.output_tokens
+                );
                 return Ok(response);
             }
 
@@ -455,6 +467,10 @@ impl Client {
                     BASE_RETRY_DELAY + jitter
                 };
 
+                warn!(
+                    "API error (status {}), retrying after {:?} (attempt {})",
+                    status, delay, attempt
+                );
                 if !delay.is_zero() {
                     std::thread::sleep(delay);
                 }
@@ -462,6 +478,7 @@ impl Client {
             }
 
             let error_text = response.text().unwrap_or_default();
+            warn!("API error (status {}): {}", status, error_text);
             anyhow::bail!("Anthropic API error (status {}): {}", status, error_text);
         }
     }

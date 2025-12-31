@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use log::debug;
 use std::io::{IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
@@ -114,6 +115,7 @@ fn fetch_tool() -> Tool {
 
 /// Read AGENTS.md from the sandbox if it exists.
 fn read_agents_md(container_name: &str) -> Option<String> {
+    debug!("Reading {} from sandbox", AGENTS_MD_PATH);
     let output = Command::new("docker")
         .args(["exec", container_name, "cat", AGENTS_MD_PATH])
         .stdout(Stdio::piped())
@@ -122,9 +124,11 @@ fn read_agents_md(container_name: &str) -> Option<String> {
         .ok()?;
 
     if !output.status.success() {
+        debug!("{} not found or not readable", AGENTS_MD_PATH);
         return None;
     }
 
+    debug!("{} loaded successfully", AGENTS_MD_PATH);
     String::from_utf8(output.stdout).ok()
 }
 
@@ -141,12 +145,14 @@ fn execute_edit_in_sandbox(
     old_string: &str,
     new_string: &str,
 ) -> Result<(String, bool)> {
+    debug!("Reading file for edit: {}", file_path);
     let output = Command::new("docker")
         .args(["exec", container_name, "cat", file_path])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .context("Failed to read file in sandbox")?;
+    debug!("File read completed");
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -176,6 +182,7 @@ fn execute_edit_in_sandbox(
 
     let new_content = content.replacen(old_string, new_string, 1);
 
+    debug!("Writing edited file: {}", file_path);
     let write_cmd = format!("cat > '{}'", file_path.replace('\'', "'\\''"));
     let mut write_process = Command::new("docker")
         .args(["exec", "-i", container_name, "bash", "-c", &write_cmd])
@@ -194,9 +201,11 @@ fn execute_edit_in_sandbox(
         .context("Failed to write to stdin")?;
     drop(stdin);
 
+    debug!("Waiting for write process to complete");
     let output = write_process
         .wait_with_output()
         .context("Failed to wait for write process")?;
+    debug!("Write process completed with status: {:?}", output.status);
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -211,6 +220,7 @@ fn execute_write_in_sandbox(
     file_path: &str,
     content: &str,
 ) -> Result<(String, bool)> {
+    debug!("Checking if file exists: {}", file_path);
     let output = Command::new("docker")
         .args(["exec", container_name, "test", "-e", file_path])
         .output()
@@ -226,12 +236,14 @@ fn execute_write_in_sandbox(
                 "mkdir -p '{}'",
                 parent.display().to_string().replace('\'', "'\\''")
             );
+            debug!("Creating parent directories for: {}", file_path);
             let _ = Command::new("docker")
                 .args(["exec", container_name, "bash", "-c", &mkdir_cmd])
                 .output();
         }
     }
 
+    debug!("Writing new file: {}", file_path);
     let write_cmd = format!("cat > '{}'", file_path.replace('\'', "'\\''"));
     let mut write_process = Command::new("docker")
         .args(["exec", "-i", container_name, "bash", "-c", &write_cmd])
@@ -250,9 +262,11 @@ fn execute_write_in_sandbox(
         .context("Failed to write to stdin")?;
     drop(stdin);
 
+    debug!("Waiting for write process to complete");
     let output = write_process
         .wait_with_output()
         .context("Failed to wait for write process")?;
+    debug!("Write process completed with status: {:?}", output.status);
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -274,14 +288,17 @@ fn save_output_to_file(container_name: &str, data: &[u8]) -> Result<String> {
     );
 
     let output_file = format!("/agent/bash-output-{}", id);
+    debug!("Saving large output to file: {}", output_file);
 
     // Create /agent directory if it doesn't exist
+    debug!("Creating /agent directory");
     Command::new("docker")
         .args(["exec", container_name, "bash", "-c", "mkdir -p /agent"])
         .output()
         .context("Failed to create /agent directory")?;
 
     // Write the output to file
+    debug!("Writing output data ({} bytes)", data.len());
     let write_cmd = format!("cat > {}", output_file);
     let mut write_process = Command::new("docker")
         .args(["exec", "-i", container_name, "bash", "-c", &write_cmd])
@@ -296,9 +313,11 @@ fn save_output_to_file(container_name: &str, data: &[u8]) -> Result<String> {
     stdin.write_all(data).context("Failed to write to stdin")?;
     drop(stdin);
 
+    debug!("Waiting for output save process to complete");
     write_process
         .wait()
         .context("Failed to wait for write process")?;
+    debug!("Output saved to file");
 
     Ok(output_file)
 }
@@ -369,12 +388,14 @@ fn get_input_via_vim(chat_history: &str) -> Result<String> {
 fn execute_bash_in_sandbox(container_name: &str, command: &str) -> Result<(String, bool)> {
     const MAX_OUTPUT_SIZE: usize = 30000;
 
+    debug!("Executing bash in sandbox: {}", command);
     let output = Command::new("docker")
         .args(["exec", container_name, "bash", "-c", command])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .context("Failed to execute command in sandbox")?;
+    debug!("Bash command completed with status: {:?}", output.status);
 
     // Combine stdout and stderr as raw bytes
     let combined_bytes = if output.stderr.is_empty() {
