@@ -305,9 +305,16 @@ pub struct Client {
 
 impl Client {
     pub fn new(api_key: String) -> Self {
+        // Use 180s timeout as API requests with large context can take >30s to complete.
+        // This includes connection, sending request body, and receiving response.
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(180))
+            .build()
+            .expect("Failed to build HTTP client");
+
         Self {
             api_key: Some(api_key),
-            client: reqwest::blocking::Client::new(),
+            client,
             cache: None,
         }
     }
@@ -323,9 +330,16 @@ impl Client {
             anyhow::bail!("ANTHROPIC_API_KEY not set and no cache provided");
         }
 
+        // Use 180s timeout as API requests with large context can take >30s to complete.
+        // This includes connection, sending request body, and receiving response.
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(180))
+            .build()
+            .context("Failed to build HTTP client")?;
+
         Ok(Self {
             api_key,
-            client: reqwest::blocking::Client::new(),
+            client,
             cache,
         })
     }
