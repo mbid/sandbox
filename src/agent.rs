@@ -575,8 +575,6 @@ pub fn run_agent(container_name: &str, model: Model, cache: Option<LlmCache>) ->
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("");
 
-                                chat_println!(chat_history, "[edit] {}", file_path);
-
                                 let (output, success) = execute_edit_in_sandbox(
                                     container_name,
                                     file_path,
@@ -584,7 +582,12 @@ pub fn run_agent(container_name: &str, model: Model, cache: Option<LlmCache>) ->
                                     new_string,
                                 )?;
 
-                                chat_println!(chat_history, "{}", output);
+                                if success {
+                                    chat_println!(chat_history, "[edit] {}", file_path);
+                                } else {
+                                    chat_println!(chat_history, "[edit] {} (failed)", file_path);
+                                    chat_println!(chat_history, "{}", output);
+                                }
                                 (output, success)
                             }
                             AgentToolName::Write => {
@@ -595,12 +598,15 @@ pub fn run_agent(container_name: &str, model: Model, cache: Option<LlmCache>) ->
                                 let content =
                                     input.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
-                                chat_println!(chat_history, "[write] {}", file_path);
-
                                 let (output, success) =
                                     execute_write_in_sandbox(container_name, file_path, content)?;
 
-                                chat_println!(chat_history, "{}", output);
+                                if success {
+                                    chat_println!(chat_history, "[write] {}", file_path);
+                                } else {
+                                    chat_println!(chat_history, "[write] {} (failed)", file_path);
+                                    chat_println!(chat_history, "{}", output);
+                                }
                                 (output, success)
                             }
                         };
@@ -621,10 +627,24 @@ pub fn run_agent(container_name: &str, model: Model, cache: Option<LlmCache>) ->
                     }
                     ContentBlock::ToolResult { .. } => {}
                     ContentBlock::Image { .. } => {}
-                    // Server-side tools (like web search, web fetch) are handled by the API
-                    ContentBlock::ServerToolUse { .. } => {}
+                    // Server-side tools (web_search, web_fetch) are handled by the API
+                    ContentBlock::ServerToolUse { name, input, .. } => {
+                        if name == "web_search" {
+                            let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                            chat_println!(chat_history, "[search] {}", query);
+                        } else if name == "web_fetch" {
+                            let url = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                            chat_println!(chat_history, "[fetch] {}", url);
+                        }
+                    }
                     ContentBlock::WebSearchToolResult { .. } => {}
-                    ContentBlock::WebFetchToolResult { .. } => {}
+                    ContentBlock::WebFetchToolResult { content, .. } => {
+                        if let crate::anthropic::WebFetchResult::WebFetchToolError { error_code } =
+                            content
+                        {
+                            chat_println!(chat_history, "[fetch] (failed: {})", error_code);
+                        }
+                    }
                 }
             }
 

@@ -1132,3 +1132,133 @@ fn test_agent_websearch() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn test_agent_write_tool_output_format() {
+    // Test that the write tool prints "[write] <filename>" on success
+    // without additional success messages or content echoing.
+    let repo = TestRepo::init();
+
+    fs::write(
+        repo.dir.join("Dockerfile"),
+        include_str!("Dockerfile-debian"),
+    )
+    .expect("Failed to write Dockerfile");
+
+    run_git(&repo.dir, &["add", "Dockerfile"]);
+    run_git(&repo.dir, &["commit", "-m", "Add Dockerfile"]);
+
+    let sandbox_name = "test-agent-write-format";
+
+    let cache_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("llm-cache");
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("sandbox"))
+        .current_dir(&repo.dir)
+        .args([
+            "agent",
+            sandbox_name,
+            "--runtime",
+            "runc",
+            "--model",
+            "haiku",
+            "--cache",
+            cache_dir.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn agent");
+
+    let stdin = child.stdin.as_mut().expect("Failed to open stdin");
+    writeln!(stdin, "Use the write tool to create a file called 'test.txt' with content 'hello'. Do not use bash.")
+        .expect("Failed to write to stdin");
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("Failed to wait for agent");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should see "[write] test.txt" in output
+    assert!(
+        stdout.contains("[write] test.txt"),
+        "Expected '[write] test.txt' in output.\nstdout: {}\nstderr: {}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Should NOT see success messages like "successful" or "Successfully"
+    let stdout_lower = stdout.to_lowercase();
+    assert!(
+        !stdout_lower.contains("successful"),
+        "Should not contain 'successful' in output.\nstdout: {}",
+        stdout
+    );
+
+    let output = run_sandbox_in(&repo.dir, &["delete", sandbox_name]);
+    assert!(
+        output.status.success(),
+        "Failed to delete sandbox: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_agent_websearch_output_format() {
+    // Test that web searches print "[search] <query>" in output.
+    let repo = TestRepo::init();
+
+    fs::write(
+        repo.dir.join("Dockerfile"),
+        include_str!("Dockerfile-debian"),
+    )
+    .expect("Failed to write Dockerfile");
+
+    run_git(&repo.dir, &["add", "Dockerfile"]);
+    run_git(&repo.dir, &["commit", "-m", "Add Dockerfile"]);
+
+    let sandbox_name = "test-agent-search-format";
+
+    let cache_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("llm-cache");
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("sandbox"))
+        .current_dir(&repo.dir)
+        .args([
+            "agent",
+            sandbox_name,
+            "--runtime",
+            "runc",
+            "--model",
+            "haiku",
+            "--cache",
+            cache_dir.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn agent");
+
+    let stdin = child.stdin.as_mut().expect("Failed to open stdin");
+    writeln!(
+        stdin,
+        "When was the last US penny minted? Answer with just the date in yyyy-mm-dd format."
+    )
+    .expect("Failed to write to stdin");
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("Failed to wait for agent");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should see "[search]" prefix for web search
+    assert!(
+        stdout.contains("[search]"),
+        "Expected '[search]' in output for web search.\nstdout: {}\nstderr: {}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = run_sandbox_in(&repo.dir, &["delete", sandbox_name]);
+    assert!(
+        output.status.success(),
+        "Failed to delete sandbox: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
