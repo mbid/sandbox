@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use log::debug;
+use sha2::{Digest, Sha256};
 use std::io::{IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
@@ -277,15 +278,11 @@ fn execute_write_in_sandbox(
 }
 
 fn save_output_to_file(container_name: &str, data: &[u8]) -> Result<String> {
-    // Generate a short random ID for the output file
-    let id = format!(
-        "{:x}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-            % 0xffffff
-    );
+    // Generate deterministic ID from content hash for reproducible cache keys
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let hash = hasher.finalize();
+    let id = hex::encode(&hash[..6]);
 
     let output_file = format!("/agent/bash-output-{}", id);
     debug!("Saving large output to file: {}", output_file);
