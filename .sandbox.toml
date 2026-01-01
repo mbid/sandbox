@@ -22,3 +22,7 @@ host = "~/.config/nvim"
 # Build artifacts as overlay (copy-on-write)
 [[mounts.overlay]]
 host = "target"
+
+# Cargo registry and crate cache
+[[mounts.overlay]]
+host = "~/.cargo/registry"
