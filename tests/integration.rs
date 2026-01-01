@@ -308,6 +308,78 @@ fn test_delete_with_readonly_files_overlayfs_mode() {
     );
 }
 
+/// Test that deletion works when using overlay mode = copy with a repo-relative mount.
+///
+/// When using copy mode with a repo-relative mount (e.g., `target`), Docker creates
+/// the mount target directory before applying mounts. Since the repo root is bind-mounted,
+/// this can result in a root-owned directory being created in the host's clone directory.
+/// The delete command should still succeed.
+#[test]
+fn test_delete_with_repo_relative_overlay_copy_mount() {
+    let repo = TestRepo::init();
+
+    // Copy the minimal Dockerfile for the sandbox
+    fs::write(
+        repo.dir.join("Dockerfile"),
+        include_str!("Dockerfile-debian"),
+    )
+    .expect("Failed to write Dockerfile");
+
+    // Add target to .gitignore (simulates typical Rust/build artifact directory)
+    fs::write(repo.dir.join(".gitignore"), "/target\n").expect("Failed to write .gitignore");
+
+    // Write a .sandbox.toml that includes a repo-relative overlay mount
+    // This mount path ("target") is relative to the repo root
+    fs::write(
+        repo.dir.join(".sandbox.toml"),
+        r#"
+env = []
+overlay-mode = "copy"
+
+[[mounts.overlay]]
+host = "target"
+"#,
+    )
+    .expect("Failed to write .sandbox.toml");
+
+    // Commit the files (but NOT target - it's gitignored)
+    run_git(
+        &repo.dir,
+        &["add", "Dockerfile", ".sandbox.toml", ".gitignore"],
+    );
+    run_git(&repo.dir, &["commit", "-m", "Add Dockerfile and config"]);
+
+    // NOW create target directory (after commit, so it's not in the clone)
+    // This simulates a build artifact directory that exists on host but not in git
+    fs::create_dir_all(repo.dir.join("target")).expect("Failed to create target directory");
+    fs::write(repo.dir.join("target/test.txt"), "test content").expect("Failed to write test.txt");
+
+    let sandbox_name = "test-delete-repo-relative-overlay";
+
+    // Enter sandbox - this triggers Docker to create the mount target directory
+    // Since target is not in the clone but we're mounting an overlay at that path,
+    // Docker creates a root-owned directory in the clone
+    let output = run_in_sandbox(&repo, sandbox_name, &["ls", "-la", "target"]);
+    assert!(
+        output.status.success(),
+        "Failed to enter sandbox: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Exit the sandbox (it should stop automatically)
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Try to delete the sandbox - this should succeed even if Docker created
+    // a root-owned directory in the clone
+    let output = run_sandbox_in(&repo.dir, &["delete", sandbox_name]);
+    assert!(
+        output.status.success(),
+        "Failed to delete sandbox with repo-relative overlay mount in copy mode: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn test_sync_with_history_rewrite() {
     let repo = TestRepo::init();
