@@ -2,3 +2,23 @@
 # See src/sandbox_config.rs for the schema documentation.
 
 env = ["ANTHROPIC_API_KEY"]
+
+# Use sysbox-runc runtime for Docker-in-Docker support
+runtime = "sysbox-runc"
+
+# Use copy mode for overlays (required for sysbox-runc compatibility)
+overlay-mode = "copy"
+
+# Read-only config file mounts
+[[mounts.readonly]]
+host = "~/.gitconfig"
+
+[[mounts.readonly]]
+host = "~/.config/fish"
+
+[[mounts.readonly]]
+host = "~/.config/nvim"
+
+# Build artifacts as overlay (copy-on-write)
+[[mounts.overlay]]
+host = "target"

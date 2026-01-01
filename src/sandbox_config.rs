@@ -4,10 +4,10 @@
 //! mount configurations, image build settings, and agent options.
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use crate::config::Model;
+use crate::config::{Model, OverlayMode, Runtime};
 
 /// Top-level configuration structure parsed from `.sandbox.toml`.
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -16,6 +16,14 @@ pub struct SandboxConfig {
     /// Environment variables that must be set on the host and passed to the container.
     #[serde(default)]
     pub env: Vec<String>,
+
+    /// Container runtime (runsc, runc, sysbox-runc).
+    #[serde(default)]
+    pub runtime: Option<Runtime>,
+
+    /// Strategy for copy-on-write mounts (overlayfs or copy).
+    #[serde(default, rename = "overlay-mode")]
+    pub overlay_mode: Option<OverlayMode>,
 
     #[serde(default)]
     pub mounts: MountsConfig,
@@ -28,7 +36,7 @@ pub struct SandboxConfig {
 }
 
 /// Mount configuration with different mount types.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct MountsConfig {
     /// Read-only mounts (container cannot modify).
@@ -46,7 +54,7 @@ pub struct MountsConfig {
 }
 
 /// A single mount entry specifying host and container paths.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MountEntry {
     /// Path on the host filesystem.
@@ -162,6 +170,7 @@ impl SandboxConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{OverlayMode, Runtime};
     use std::fs;
     use tempfile::TempDir;
 
@@ -194,6 +203,9 @@ env = ["ANTHROPIC_API_KEY"]
             r#"
 env = ["ANTHROPIC_API_KEY", "GITHUB_TOKEN"]
 
+runtime = "sysbox-runc"
+overlay-mode = "copy"
+
 [[mounts.readonly]]
 host = "~/.gitconfig"
 
@@ -223,6 +235,8 @@ editor = "vim"
 
         let config = SandboxConfig::load(dir.path()).unwrap();
         assert_eq!(config.env, vec!["ANTHROPIC_API_KEY", "GITHUB_TOKEN"]);
+        assert_eq!(config.runtime, Some(Runtime::SysboxRunc));
+        assert_eq!(config.overlay_mode, Some(OverlayMode::Copy));
         assert_eq!(config.mounts.readonly.len(), 2);
         assert_eq!(config.mounts.unsafe_write.len(), 1);
         assert_eq!(config.mounts.overlay.len(), 2);

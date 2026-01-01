@@ -4,7 +4,8 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// Container runtime to use for sandboxing.
-#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Runtime {
     /// gVisor runtime (default) - strong isolation via kernel syscall interception
     #[default]
@@ -16,7 +17,8 @@ pub enum Runtime {
 }
 
 /// Strategy for copy-on-write mounts (writes inside container don't propagate to host).
-#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum OverlayMode {
     /// Use overlayfs (default) - efficient but may have permission issues with sysbox
     #[default]

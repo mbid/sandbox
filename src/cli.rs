@@ -29,14 +29,13 @@ pub enum Commands {
         /// Name for this sandbox instance
         name: String,
 
-        /// Container runtime to use for sandboxing
-        #[arg(short, long, value_enum, default_value_t = Runtime::Runsc)]
-        runtime: Runtime,
+        /// Container runtime (overrides config file, default: runsc)
+        #[arg(short, long, value_enum)]
+        runtime: Option<Runtime>,
 
-        /// Strategy for copy-on-write mounts (directories that are writable inside the
-        /// container but don't propagate changes to the host)
-        #[arg(short, long, value_enum, default_value_t = OverlayMode::Overlayfs)]
-        overlay_mode: OverlayMode,
+        /// Strategy for copy-on-write mounts (overrides config file, default: overlayfs)
+        #[arg(short, long, value_enum)]
+        overlay_mode: Option<OverlayMode>,
 
         /// Command to run inside the sandbox (default: interactive shell)
         #[arg(last = true)]
@@ -57,13 +56,13 @@ pub enum Commands {
         /// Name of the sandbox to use
         name: String,
 
-        /// Container runtime to use for sandboxing
-        #[arg(short, long, value_enum, default_value_t = Runtime::Runsc)]
-        runtime: Runtime,
+        /// Container runtime (overrides config file, default: runsc)
+        #[arg(short, long, value_enum)]
+        runtime: Option<Runtime>,
 
-        /// Strategy for copy-on-write mounts
-        #[arg(short, long, value_enum, default_value_t = OverlayMode::Overlayfs)]
-        overlay_mode: OverlayMode,
+        /// Strategy for copy-on-write mounts (overrides config file, default: overlayfs)
+        #[arg(short, long, value_enum)]
+        overlay_mode: Option<OverlayMode>,
 
         /// Claude model to use (overrides config file)
         #[arg(short, long, value_enum)]
@@ -186,6 +185,11 @@ pub fn run() -> Result<()> {
                     command,
                 } => {
                     let env_vars = sandbox_config.resolve_env_vars()?;
+                    // CLI flags override config file values
+                    let runtime = runtime.or(sandbox_config.runtime).unwrap_or_default();
+                    let overlay_mode = overlay_mode
+                        .or(sandbox_config.overlay_mode)
+                        .unwrap_or_default();
                     run_sandbox(
                         &repo_root,
                         &sandbox_config,
@@ -214,7 +218,11 @@ pub fn run() -> Result<()> {
                     let llm_cache = cache
                         .map(|dir| LlmCache::new(&dir, "anthropic"))
                         .transpose()?;
-                    // CLI model flag overrides config file
+                    // CLI flags override config file values
+                    let runtime = runtime.or(sandbox_config.runtime).unwrap_or_default();
+                    let overlay_mode = overlay_mode
+                        .or(sandbox_config.overlay_mode)
+                        .unwrap_or_default();
                     let model = model.or(sandbox_config.agent.model).unwrap_or_default();
                     run_agent(
                         &repo_root,
@@ -289,8 +297,8 @@ fn run_sandbox(
 ) -> Result<()> {
     let image_tag = resolve_image_tag(repo_root, config, user_info)?;
 
-    // Ensure sandbox is set up
-    let info = sandbox::ensure_sandbox(repo_root, name)?;
+    // Ensure sandbox is set up (saves mounts config for daemon to use)
+    let info = sandbox::ensure_sandbox(repo_root, name, config)?;
 
     // Run the sandbox
     let cmd = if command.is_empty() {
@@ -370,7 +378,7 @@ fn run_agent(
     llm_cache: Option<LlmCache>,
 ) -> Result<()> {
     let image_tag = resolve_image_tag(repo_root, config, user_info)?;
-    let info = sandbox::ensure_sandbox(repo_root, name)?;
+    let info = sandbox::ensure_sandbox(repo_root, name, config)?;
 
     let _daemon_conn = sandbox::ensure_container_running(
         &info,

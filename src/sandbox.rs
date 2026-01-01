@@ -391,6 +391,22 @@ impl SandboxInfo {
     pub fn create_overlay(&self, name: &str, lower: &Path) -> Overlay {
         Overlay::new(name, lower, &self.overlays_dir(), &self.volume_prefix())
     }
+
+    /// Save the mounts configuration for this sandbox.
+    pub fn save_mounts_config(&self, config: &crate::sandbox_config::MountsConfig) -> Result<()> {
+        let path = self.sandbox_dir.join("mounts.json");
+        let contents = serde_json::to_string_pretty(config)?;
+        std::fs::write(&path, contents)?;
+        Ok(())
+    }
+
+    /// Load the mounts configuration for this sandbox.
+    pub fn load_mounts_config(&self) -> Result<crate::sandbox_config::MountsConfig> {
+        let path = self.sandbox_dir.join("mounts.json");
+        let contents = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read mounts config: {}", path.display()))?;
+        serde_json::from_str(&contents).context("Failed to parse mounts config")
+    }
 }
 
 /// List all sandbox instances for a repository.
@@ -529,44 +545,79 @@ pub fn delete_sandbox(info: &SandboxInfo) -> Result<()> {
 }
 
 /// Build the list of mounts for a sandbox container.
-pub fn build_mount_list(info: &SandboxInfo, user_info: &UserInfo) -> Vec<Mount> {
-    let home = dirs::home_dir();
-    let container_home = format!("/home/{}", user_info.username);
+pub fn build_mount_list(
+    info: &SandboxInfo,
+    user_info: &UserInfo,
+    config: &crate::sandbox_config::SandboxConfig,
+) -> Result<Vec<Mount>> {
+    use crate::sandbox_config::SandboxConfig;
 
-    // Core mounts for the repository setup
+    // Core mounts for the repository setup (always required)
     let mut mounts = vec![
         // meta.git at its actual path (read-only, for git alternates and sandbox remote)
-        // The sandbox clone's alternates reference this path
         Mount::new(&info.meta_git_dir, MountMode::ReadOnly),
         // Sandbox clone at the original repo path (write-through for working directory)
         Mount::new(&info.clone_dir, MountMode::WriteThrough).with_container_path(&info.repo_root),
         // Sandbox clone at its actual path (write-through for git operations)
         Mount::new(&info.clone_dir, MountMode::WriteThrough),
-        // Overlay for target/ directory (Rust build artifacts, copy-on-write)
-        Mount::new(info.repo_root.join("target"), MountMode::Overlay),
     ];
 
-    // Read-only config mounts
-    if let Some(ref home) = home {
-        mounts.push(
-            Mount::new(home.join(".gitconfig"), MountMode::ReadOnly)
-                .with_container_path(format!("{}/.gitconfig", container_home)),
-        );
-
-        if user_info.uses_fish() {
-            mounts.push(
-                Mount::new(home.join(".config/fish"), MountMode::ReadOnly)
-                    .with_container_path(format!("{}/.config/fish", container_home)),
-            );
+    // Add read-only mounts from config
+    for entry in &config.mounts.readonly {
+        let host_path = SandboxConfig::expand_host_path(&entry.host, &info.repo_root)?;
+        let mut mount = Mount::new(&host_path, MountMode::ReadOnly);
+        if let Some(ref container) = entry.container {
+            let container_path =
+                SandboxConfig::expand_container_path(container, &user_info.username);
+            mount = mount.with_container_path(container_path);
+        } else {
+            // Default: expand host path for container too (handles ~ expansion)
+            let container_path =
+                SandboxConfig::expand_container_path(&entry.host, &user_info.username);
+            if container_path != entry.host {
+                mount = mount.with_container_path(container_path);
+            }
         }
-
-        mounts.push(
-            Mount::new(home.join(".config/nvim"), MountMode::ReadOnly)
-                .with_container_path(format!("{}/.config/nvim", container_home)),
-        );
+        mounts.push(mount);
     }
 
-    mounts
+    // Add write-through mounts from config
+    for entry in &config.mounts.unsafe_write {
+        let host_path = SandboxConfig::expand_host_path(&entry.host, &info.repo_root)?;
+        let mut mount = Mount::new(&host_path, MountMode::WriteThrough);
+        if let Some(ref container) = entry.container {
+            let container_path =
+                SandboxConfig::expand_container_path(container, &user_info.username);
+            mount = mount.with_container_path(container_path);
+        } else {
+            let container_path =
+                SandboxConfig::expand_container_path(&entry.host, &user_info.username);
+            if container_path != entry.host {
+                mount = mount.with_container_path(container_path);
+            }
+        }
+        mounts.push(mount);
+    }
+
+    // Add overlay mounts from config
+    for entry in &config.mounts.overlay {
+        let host_path = SandboxConfig::expand_host_path(&entry.host, &info.repo_root)?;
+        let mut mount = Mount::new(&host_path, MountMode::Overlay);
+        if let Some(ref container) = entry.container {
+            let container_path =
+                SandboxConfig::expand_container_path(container, &user_info.username);
+            mount = mount.with_container_path(container_path);
+        } else {
+            let container_path =
+                SandboxConfig::expand_container_path(&entry.host, &user_info.username);
+            if container_path != entry.host {
+                mount = mount.with_container_path(container_path);
+            }
+        }
+        mounts.push(mount);
+    }
+
+    Ok(mounts)
 }
 
 /// Ensure the container is running (start it if not), then exec a command into it.
@@ -653,7 +704,13 @@ pub fn ensure_container_running_internal(
         info.repo_root.to_string_lossy().to_string(),
     ];
 
-    let mounts = build_mount_list(info, user_info);
+    // Load mounts config saved during ensure_sandbox
+    let mounts_config = info.load_mounts_config()?;
+    let config = crate::sandbox_config::SandboxConfig {
+        mounts: mounts_config,
+        ..Default::default()
+    };
+    let mounts = build_mount_list(info, user_info, &config)?;
     args.extend(process_mounts(&mounts, info, overlay_mode)?);
 
     if let Some(home) = dirs::home_dir() {
@@ -701,7 +758,11 @@ pub fn ensure_container_running_internal(
 }
 
 /// Ensure a sandbox is set up and ready to use.
-pub fn ensure_sandbox(repo_root: &Path, name: &str) -> Result<SandboxInfo> {
+pub fn ensure_sandbox(
+    repo_root: &Path,
+    name: &str,
+    config: &crate::sandbox_config::SandboxConfig,
+) -> Result<SandboxInfo> {
     let info = SandboxInfo::new(name, repo_root)?;
 
     // Create sandbox directory
@@ -728,8 +789,9 @@ pub fn ensure_sandbox(repo_root: &Path, name: &str) -> Result<SandboxInfo> {
     // Setup remotes for the sandbox repo (rename "origin" to "sandbox")
     git::setup_sandbox_remotes(&info.meta_git_dir, &info.clone_dir)?;
 
-    // Save sandbox info
+    // Save sandbox info and mounts config (mounts config used by daemon)
     info.save()?;
+    info.save_mounts_config(&config.mounts)?;
 
     Ok(info)
 }
