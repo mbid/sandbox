@@ -111,12 +111,49 @@ fn copy_dir_reflink(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Pre-create mount target directories in the clone to prevent Docker from creating them as root.
+///
+/// When Docker starts a container, it creates any missing mount target directories before
+/// applying bind mounts. If the clone directory is already bind-mounted at repo_root, Docker
+/// will create subdirectories inside it as root. This function pre-creates these directories
+/// with the correct ownership.
+fn precreate_mount_targets_in_clone(mounts: &[Mount], info: &SandboxInfo) -> Result<()> {
+    for mount in mounts {
+        if !mount.host_path.exists() {
+            continue;
+        }
+
+        let target = mount.target_path();
+
+        // Check if target path is inside repo_root (i.e., would be created inside the clone)
+        if let Ok(relative) = target.strip_prefix(&info.repo_root) {
+            let clone_target = info.clone_dir.join(relative);
+            if !clone_target.exists() {
+                debug!(
+                    "Pre-creating mount target in clone: {}",
+                    clone_target.display()
+                );
+                std::fs::create_dir_all(&clone_target).with_context(|| {
+                    format!(
+                        "Failed to pre-create mount target: {}",
+                        clone_target.display()
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Process mounts and generate docker arguments.
 pub fn process_mounts(
     mounts: &[Mount],
     info: &SandboxInfo,
     overlay_mode: OverlayMode,
 ) -> Result<Vec<String>> {
+    // Pre-create mount target directories in clone to prevent Docker from creating them as root
+    precreate_mount_targets_in_clone(mounts, info)?;
+
     let mut docker_args = Vec::new();
 
     for mount in mounts {
