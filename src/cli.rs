@@ -79,23 +79,6 @@ pub enum Commands {
     InternalDaemon {
         /// Path to the sandbox directory
         sandbox_dir: PathBuf,
-        /// Docker image tag
-        image_tag: String,
-        /// Username for container
-        username: String,
-        /// UID for container
-        uid: u32,
-        /// GID for container
-        gid: u32,
-        /// Shell for container
-        shell: String,
-        /// Container runtime name
-        runtime: String,
-        /// Overlay mode
-        overlay_mode: String,
-        /// Environment variables in NAME=VALUE format
-        #[arg(trailing_var_arg = true)]
-        env_vars: Vec<String>,
     },
 }
 
@@ -107,7 +90,7 @@ fn init_logging(command: &Commands) -> Result<()> {
         | Commands::Agent { .. } => {
             env_logger::init();
         }
-        Commands::InternalDaemon { sandbox_dir, .. } => {
+        Commands::InternalDaemon { sandbox_dir } => {
             let log_path = sandbox_dir.join("daemon.log");
             let log_file = OpenOptions::new()
                 .create(true)
@@ -127,50 +110,9 @@ pub fn run() -> Result<()> {
     init_logging(&cli.command)?;
 
     match cli.command {
-        Commands::InternalDaemon {
-            sandbox_dir,
-            image_tag,
-            username,
-            uid,
-            gid,
-            shell,
-            runtime,
-            overlay_mode,
-            env_vars,
-        } => {
+        Commands::InternalDaemon { sandbox_dir } => {
             let info = sandbox::SandboxInfo::load(&sandbox_dir)?;
-            let user_info = UserInfo {
-                username,
-                uid,
-                gid,
-                shell,
-            };
-            let runtime = match runtime.as_str() {
-                "runsc" => Runtime::Runsc,
-                "runc" => Runtime::Runc,
-                "sysbox-runc" => Runtime::SysboxRunc,
-                _ => bail!("Unknown runtime: {}", runtime),
-            };
-            let overlay_mode = match overlay_mode.as_str() {
-                "overlayfs" => OverlayMode::Overlayfs,
-                "copy" => OverlayMode::Copy,
-                _ => bail!("Unknown overlay mode: {}", overlay_mode),
-            };
-            let env_vars: Vec<(String, String)> = env_vars
-                .into_iter()
-                .filter_map(|s| {
-                    let mut parts = s.splitn(2, '=');
-                    Some((parts.next()?.to_string(), parts.next()?.to_string()))
-                })
-                .collect();
-            daemon::run_daemon_with_sync(
-                &info,
-                &image_tag,
-                &user_info,
-                runtime,
-                overlay_mode,
-                &env_vars,
-            )?;
+            daemon::run_daemon(&info)?;
         }
         _ => {
             // All other commands need repo_root, user_info, and sandbox config

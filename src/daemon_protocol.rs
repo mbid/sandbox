@@ -4,10 +4,108 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 
+use crate::config::{OverlayMode, Runtime, UserInfo};
+
+/// Parameters needed to start a sandbox container.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxParams {
+    pub image_tag: String,
+    pub user_info: UserInfoWire,
+    pub runtime: RuntimeWire,
+    pub overlay_mode: OverlayModeWire,
+    pub env_vars: Vec<(String, String)>,
+}
+
+/// Wire format for UserInfo (serializable).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserInfoWire {
+    pub username: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub shell: String,
+}
+
+impl From<&UserInfo> for UserInfoWire {
+    fn from(u: &UserInfo) -> Self {
+        Self {
+            username: u.username.clone(),
+            uid: u.uid,
+            gid: u.gid,
+            shell: u.shell.clone(),
+        }
+    }
+}
+
+impl From<UserInfoWire> for UserInfo {
+    fn from(w: UserInfoWire) -> Self {
+        Self {
+            username: w.username,
+            uid: w.uid,
+            gid: w.gid,
+            shell: w.shell,
+        }
+    }
+}
+
+/// Wire format for Runtime (serializable).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeWire {
+    Runsc,
+    Runc,
+    SysboxRunc,
+}
+
+impl From<Runtime> for RuntimeWire {
+    fn from(r: Runtime) -> Self {
+        match r {
+            Runtime::Runsc => Self::Runsc,
+            Runtime::Runc => Self::Runc,
+            Runtime::SysboxRunc => Self::SysboxRunc,
+        }
+    }
+}
+
+impl From<RuntimeWire> for Runtime {
+    fn from(w: RuntimeWire) -> Self {
+        match w {
+            RuntimeWire::Runsc => Self::Runsc,
+            RuntimeWire::Runc => Self::Runc,
+            RuntimeWire::SysboxRunc => Self::SysboxRunc,
+        }
+    }
+}
+
+/// Wire format for OverlayMode (serializable).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayModeWire {
+    Overlayfs,
+    Copy,
+}
+
+impl From<OverlayMode> for OverlayModeWire {
+    fn from(m: OverlayMode) -> Self {
+        match m {
+            OverlayMode::Overlayfs => Self::Overlayfs,
+            OverlayMode::Copy => Self::Copy,
+        }
+    }
+}
+
+impl From<OverlayModeWire> for OverlayMode {
+    fn from(w: OverlayModeWire) -> Self {
+        match w {
+            OverlayModeWire::Overlayfs => Self::Overlayfs,
+            OverlayModeWire::Copy => Self::Copy,
+        }
+    }
+}
+
 /// Daemon RPC API.
 pub trait DaemonApi {
     /// Ensure the sandbox is running. Blocks until the container is started.
-    fn ensure_sandbox(&mut self, sandbox_name: &str) -> Result<()>;
+    fn ensure_sandbox(&mut self, sandbox_name: &str, params: &SandboxParams) -> Result<()>;
 }
 
 /// Client implementation of the daemon API over a stream.
@@ -27,11 +125,12 @@ impl<S> Client<S> {
 }
 
 impl<S: std::io::Read + Write> DaemonApi for Client<S> {
-    fn ensure_sandbox(&mut self, sandbox_name: &str) -> Result<()> {
+    fn ensure_sandbox(&mut self, sandbox_name: &str, params: &SandboxParams) -> Result<()> {
         let request = Request {
             method: Method::EnsureSandbox,
             params: Some(RequestParams::EnsureSandbox(EnsureSandboxParams {
                 sandbox_name: sandbox_name.to_string(),
+                params: params.clone(),
             })),
         };
 
@@ -95,6 +194,7 @@ enum RequestParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EnsureSandboxParams {
     sandbox_name: String,
+    params: SandboxParams,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,7 +247,10 @@ pub mod server {
     /// A parsed client request.
     #[derive(Debug)]
     pub enum ClientRequest {
-        EnsureSandbox { sandbox_name: String },
+        EnsureSandbox {
+            sandbox_name: String,
+            params: SandboxParams,
+        },
     }
 
     /// Read and parse a request from a client stream.
@@ -173,6 +276,7 @@ pub mod server {
                 };
                 Ok(ClientRequest::EnsureSandbox {
                     sandbox_name: params.sandbox_name,
+                    params: params.params,
                 })
             }
         }

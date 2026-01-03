@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::{OverlayMode, Runtime, UserInfo};
-use crate::daemon_protocol::{self, DaemonApi};
+use crate::daemon_protocol::{self, DaemonApi, SandboxParams};
 use crate::docker;
 use crate::git;
 use crate::sandbox::SandboxInfo;
@@ -92,57 +92,50 @@ pub fn connect_or_launch(
     let sock_path = socket_path(info);
     let lock_path = lockfile_path(info);
 
+    let params = SandboxParams {
+        image_tag: image_tag.to_string(),
+        user_info: user_info.into(),
+        runtime: runtime.into(),
+        overlay_mode: overlay_mode.into(),
+        env_vars: env_vars.to_vec(),
+    };
+
     // Try to connect to existing socket
+    // TODO: We should verify that the existing sandbox was launched with the same
+    // parameters, and return an error if they differ. Currently we silently ignore
+    // any parameter differences.
     if let Ok(stream) = UnixStream::connect(&sock_path) {
         debug!("Connected to existing daemon");
-        let stream = do_handshake(stream, &info.name)?;
+        let stream = do_handshake(stream, &info.name, &params)?;
         return Ok(DaemonConnection { stream });
     }
 
     // Spawn a new daemon (it will handle lock acquisition with backoff)
     debug!("Launching daemon...");
-    spawn_daemon(info, image_tag, user_info, runtime, overlay_mode, env_vars)?;
+    spawn_daemon(info)?;
 
     // Wait for socket to become connectable (not just exist)
     let stream = wait_for_socket_connectable(&sock_path, &lock_path)?;
-    let stream = do_handshake(stream, &info.name)?;
+    let stream = do_handshake(stream, &info.name, &params)?;
 
     Ok(DaemonConnection { stream })
 }
 
-fn do_handshake(stream: UnixStream, sandbox_name: &str) -> Result<UnixStream> {
+fn do_handshake(
+    stream: UnixStream,
+    sandbox_name: &str,
+    params: &SandboxParams,
+) -> Result<UnixStream> {
     let mut client = daemon_protocol::Client::new(stream);
-    client.ensure_sandbox(sandbox_name)?;
+    client.ensure_sandbox(sandbox_name, params)?;
     Ok(client.into_inner())
 }
 
-fn spawn_daemon(
-    info: &SandboxInfo,
-    image_tag: &str,
-    user_info: &UserInfo,
-    runtime: Runtime,
-    overlay_mode: OverlayMode,
-    env_vars: &[(String, String)],
-) -> Result<()> {
+fn spawn_daemon(info: &SandboxInfo) -> Result<()> {
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
 
     let mut cmd = Command::new(exe);
-    cmd.arg("internal-daemon")
-        .arg(&info.sandbox_dir)
-        .arg(image_tag)
-        .arg(&user_info.username)
-        .arg(user_info.uid.to_string())
-        .arg(user_info.gid.to_string())
-        .arg(&user_info.shell)
-        .arg(runtime.docker_runtime_name())
-        .arg(match overlay_mode {
-            OverlayMode::Overlayfs => "overlayfs",
-            OverlayMode::Copy => "copy",
-        });
-
-    for (name, value) in env_vars {
-        cmd.arg(format!("{}={}", name, value));
-    }
+    cmd.arg("internal-daemon").arg(&info.sandbox_dir);
 
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -333,9 +326,15 @@ fn bind_socket(sock_path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-/// Handle a client request: read the JSON-RPC request, process it, and send response.
-/// Returns the stream on success (for keeping the connection alive), or None on error.
-fn handle_client_request(mut stream: UnixStream) -> Option<UnixStream> {
+/// Result of reading a client request.
+struct ClientRequestResult {
+    stream: UnixStream,
+    params: SandboxParams,
+}
+
+/// Read a client request and extract sandbox parameters.
+/// Returns None on error (after sending error response).
+fn read_client_request(mut stream: UnixStream) -> Option<ClientRequestResult> {
     use daemon_protocol::server::{self, ClientRequest};
 
     let request = match server::read_request(&mut stream) {
@@ -350,26 +349,25 @@ fn handle_client_request(mut stream: UnixStream) -> Option<UnixStream> {
     debug!("Received request: {:?}", request);
 
     match request {
-        ClientRequest::EnsureSandbox { .. } => {
-            if server::send_ensure_sandbox_ok(&mut stream).is_err() {
-                error!("Failed to send response to client");
-                return None;
-            }
-        }
+        ClientRequest::EnsureSandbox { params, .. } => Some(ClientRequestResult { stream, params }),
+    }
+}
+
+/// Send success response to a client and prepare the stream for connection tracking.
+/// Returns the stream on success, or None on error.
+fn send_success_and_track(mut stream: UnixStream) -> Option<UnixStream> {
+    use daemon_protocol::server;
+
+    if server::send_ensure_sandbox_ok(&mut stream).is_err() {
+        error!("Failed to send response to client");
+        return None;
     }
 
     stream.set_nonblocking(true).ok();
     Some(stream)
 }
 
-pub fn run_daemon_with_sync(
-    info: &SandboxInfo,
-    image_tag: &str,
-    user_info: &UserInfo,
-    runtime: Runtime,
-    overlay_mode: OverlayMode,
-    env_vars: &[(String, String)],
-) -> Result<()> {
+pub fn run_daemon(info: &SandboxInfo) -> Result<()> {
     info!("Daemon starting for sandbox '{}'", info.name);
 
     let lock_path = lockfile_path(info);
@@ -402,6 +400,7 @@ pub fn run_daemon_with_sync(
     info!("Listening on {}", sock_path.display());
 
     let mut clients: Vec<UnixStream> = Vec::new();
+    // Pending clients: streams that have been read but are waiting for container to start
     let mut pending_clients: Vec<UnixStream> = Vec::new();
     let start = Instant::now();
     let mut container_started = false;
@@ -415,29 +414,43 @@ pub fn run_daemon_with_sync(
                 );
 
                 if container_started {
-                    if let Some(stream) = handle_client_request(stream) {
-                        clients.push(stream);
+                    // Container already running - just read request and respond
+                    if let Some(req) = read_client_request(stream) {
+                        if let Some(stream) = send_success_and_track(req.stream) {
+                            clients.push(stream);
+                        }
                     }
                 } else {
+                    // Container not started yet - read request to get params
+                    let Some(req) = read_client_request(stream) else {
+                        continue;
+                    };
+
                     let is_first = pending_clients.is_empty();
-                    pending_clients.push(stream);
+                    pending_clients.push(req.stream);
 
                     if is_first {
+                        // First client provides the sandbox parameters
+                        let params = req.params;
+                        let user_info: UserInfo = params.user_info.into();
+                        let runtime: Runtime = params.runtime.into();
+                        let overlay_mode: OverlayMode = params.overlay_mode.into();
+
                         info!("First client connected, starting container...");
                         match start_container(
                             info,
-                            image_tag,
-                            user_info,
+                            &params.image_tag,
+                            &user_info,
                             runtime,
                             overlay_mode,
-                            env_vars,
+                            &params.env_vars,
                         ) {
                             Ok(()) => {
                                 container_started = true;
                                 info!("Container started successfully");
 
                                 for client in pending_clients.drain(..) {
-                                    if let Some(stream) = handle_client_request(client) {
+                                    if let Some(stream) = send_success_and_track(client) {
                                         clients.push(stream);
                                     }
                                 }
