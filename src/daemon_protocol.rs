@@ -108,9 +108,6 @@ impl From<OverlayModeWire> for OverlayMode {
 pub trait DaemonApi {
     /// Ensure the sandbox is running. Blocks until the container is started.
     fn ensure_sandbox(&mut self, sandbox_name: &str, params: &SandboxParams) -> Result<()>;
-
-    /// Shutdown the daemon gracefully.
-    fn shutdown(&mut self) -> Result<()>;
 }
 
 /// Client implementation of the daemon API over a stream.
@@ -148,22 +145,6 @@ impl<S: std::io::Read + Write> DaemonApi for Client<S> {
 
         Ok(())
     }
-
-    fn shutdown(&mut self) -> Result<()> {
-        let request = Request {
-            method: Method::Shutdown,
-            params: None,
-        };
-
-        send_request(&mut self.stream, &request)?;
-        let response = read_response(&mut self.stream)?;
-
-        if let Some(err) = response.error {
-            bail!("Daemon error: {} (code {})", err.message, err.code);
-        }
-
-        Ok(())
-    }
 }
 
 fn send_request(stream: &mut impl Write, request: &Request) -> Result<()> {
@@ -190,14 +171,11 @@ fn read_response(stream: &mut impl std::io::Read) -> Result<Response> {
 }
 
 // --- Wire format types ---
-// TODO: Refactor server side to use a trait-based API as well.
-// Currently blocked on the daemon's custom polling logic for connection liveness.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Method {
     EnsureSandbox,
-    Shutdown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,14 +209,10 @@ struct Response {
 #[serde(untagged)]
 enum ResponseResult {
     EnsureSandbox(EnsureSandboxResult),
-    Shutdown(ShutdownResult),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct EnsureSandboxResult {}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct ShutdownResult {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RpcError {
@@ -277,7 +251,6 @@ pub mod server {
             sandbox_name: String,
             params: SandboxParams,
         },
-        Shutdown,
     }
 
     /// Read and parse a request from a client stream.
@@ -306,19 +279,12 @@ pub mod server {
                     params: params.params,
                 })
             }
-            Method::Shutdown => Ok(ClientRequest::Shutdown),
         }
     }
 
     /// Send a success response for ensure_sandbox.
     pub fn send_ensure_sandbox_ok(stream: &mut impl Write) -> Result<()> {
         let response = Response::success(ResponseResult::EnsureSandbox(EnsureSandboxResult {}));
-        send_response(stream, &response)
-    }
-
-    /// Send a success response for shutdown.
-    pub fn send_shutdown_ok(stream: &mut impl Write) -> Result<()> {
-        let response = Response::success(ResponseResult::Shutdown(ShutdownResult {}));
         send_response(stream, &response)
     }
 

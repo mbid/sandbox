@@ -252,15 +252,12 @@ struct SandboxState {
 struct DaemonState {
     /// Active sandboxes, keyed by sandbox name.
     sandboxes: HashMap<String, SandboxState>,
-    /// Flag to signal shutdown.
-    shutdown: bool,
 }
 
 impl DaemonState {
     fn new() -> Self {
         DaemonState {
             sandboxes: HashMap::new(),
-            shutdown: false,
         }
     }
 }
@@ -314,12 +311,6 @@ fn handle_client(mut stream: UnixStream, state: SharedState, client_id: u64) {
             params,
         } => {
             handle_ensure_sandbox(stream, state, client_id, &sandbox_name, params);
-        }
-        server::ClientRequest::Shutdown => {
-            info!("Client {} requested shutdown", client_id);
-            let mut state = state.lock().unwrap();
-            state.shutdown = true;
-            let _ = server::send_shutdown_ok(&mut stream);
         }
     }
 }
@@ -455,36 +446,13 @@ fn handle_ensure_sandbox(
         return;
     }
 
-    // Now wait for client to disconnect (keep connection open)
-    stream.set_nonblocking(true).ok();
-
-    loop {
-        let mut buf = [0u8; 1];
-        match stream.read(&mut buf) {
-            Ok(0) => {
-                // Client disconnected
-                info!("Client {} disconnected", client_id);
-                break;
-            }
-            Ok(_) => {
-                // Unexpected data, ignore
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No data, check if we should shutdown
-                let state = state.lock().unwrap();
-                if state.shutdown {
-                    info!("Client {}: daemon shutting down", client_id);
-                    break;
-                }
-                drop(state);
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(_) => {
-                // Connection error
-                info!("Client {}: connection error", client_id);
-                break;
-            }
-        }
+    // Wait for client to disconnect by blocking on read.
+    // When the client closes its end, read() returns Ok(0) or an error.
+    let mut buf = [0u8; 1];
+    match stream.read(&mut buf) {
+        Ok(0) => info!("Client {} disconnected", client_id),
+        Ok(_) => info!("Client {} sent unexpected data, disconnecting", client_id),
+        Err(e) => info!("Client {} connection error: {}", client_id, e),
     }
 
     // Decrement client count and clean up if needed
@@ -541,11 +509,9 @@ pub fn run_daemon() -> Result<()> {
 
     let state = Arc::new(Mutex::new(DaemonState::new()));
     let mut client_id: u64 = 0;
-    let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
-    // Set listener to non-blocking so we can check for shutdown
-    listener.set_nonblocking(true)?;
-
+    // The daemon runs forever, accepting connections.
+    // It is expected to be terminated by a signal (e.g. SIGTERM).
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -553,39 +519,13 @@ pub fn run_daemon() -> Result<()> {
                 let state = Arc::clone(&state);
                 let id = client_id;
 
-                let handle = thread::spawn(move || {
+                thread::spawn(move || {
                     handle_client(stream, state, id);
                 });
-                handles.push(handle);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No pending connection, check shutdown flag
-                {
-                    let state = state.lock().unwrap();
-                    if state.shutdown && state.sandboxes.is_empty() {
-                        info!("Shutdown requested and no active sandboxes, exiting");
-                        break;
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(100));
             }
             Err(e) => {
                 error!("Accept error: {}", e);
             }
         }
-
-        // Clean up finished threads
-        handles.retain(|h| !h.is_finished());
     }
-
-    // Wait for all client handlers to finish
-    for handle in handles {
-        let _ = handle.join();
-    }
-
-    // Clean up socket
-    let _ = std::fs::remove_file(&sock_path);
-
-    info!("Daemon exiting");
-    Ok(())
 }
