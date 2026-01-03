@@ -322,7 +322,7 @@ fn save_output_to_file(container_name: &str, data: &[u8]) -> Result<String> {
 /// Prompts user to confirm exit when they submit empty input.
 /// Returns true if user wants to exit (Enter or 'y'), false otherwise.
 fn confirm_exit() -> Result<bool> {
-    eprint!("Exit? [Y/n] ");
+    eprintln!("Exit? [Y/n] ");
     std::io::stderr().flush()?;
 
     let mut buf = [0u8; 1];

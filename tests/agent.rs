@@ -3,7 +3,7 @@
 mod common;
 
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -165,7 +165,12 @@ fn test_agent_large_file_output() {
 
 #[test]
 fn test_agent_vim_input() {
-    // Test the vim-based input mode using a PTY to simulate a real terminal
+    // Test the vim-based input mode by mocking vim with a script that:
+    // 1. First invocation: appends a prompt to the file
+    // 2. Second invocation: exits without changes, triggering "Exit? [Y/n]" prompt
+    // We then send "Y\n" via PTY to confirm exit.
+    //
+    // A PTY is required because the agent only uses vim input mode when stdin is a TTY.
     let fixture = SandboxFixture::new("test-agent-vim");
 
     let secret_content = "VIM_TEST_SECRET_98765";
@@ -175,49 +180,40 @@ fn test_agent_vim_input() {
     run_git(&fixture.repo.dir, &["add", "secret.txt"]);
     run_git(&fixture.repo.dir, &["commit", "--amend", "--no-edit"]);
 
-    // Create a directory for the mock vim script
+    // Create mock vim script
     let mock_bin_dir = fixture.repo.dir.join("mock-bin");
     fs::create_dir_all(&mock_bin_dir).expect("Failed to create mock-bin dir");
 
-    // Create a unique marker file path for this test
     let marker_file = fixture.repo.dir.join("vim-marker");
 
-    // Create a mock vim script that:
-    // 1. On first invocation: appends a test message and creates a marker
-    // 2. On subsequent invocations: sleeps forever (will be killed by test timeout)
+    // Mock vim: first call appends prompt, second call exits immediately (no changes)
     let mock_vim_script = formatdoc! {r#"
         #!/bin/bash
         FILE="$1"
         MARKER="{marker}"
 
         if [ -f "$MARKER" ]; then
-            # Second invocation: sleep forever, test will kill us
-            sleep 3600
+            # Second invocation: exit without modifying the file
             exit 0
         fi
 
-        # First invocation: append the test message
+        # First invocation: append the test message and create marker
         echo "" >> "$FILE"
         echo "Run \`cat secret.txt\` and tell me what it contains." >> "$FILE"
-
-        # Create marker for next invocation
         touch "$MARKER"
     "#, marker = marker_file.display()};
 
     let mock_vim_path = mock_bin_dir.join("vim");
     fs::write(&mock_vim_path, mock_vim_script).expect("Failed to write mock vim");
-
-    // Make mock vim executable
     Command::new("chmod")
         .args(["+x", mock_vim_path.to_str().unwrap()])
         .output()
         .expect("Failed to chmod mock vim");
 
-    // Get current PATH and prepend mock bin dir
     let current_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", mock_bin_dir.display(), current_path);
 
-    // Create a PTY to simulate a real terminal
+    // Create PTY - required for agent to use vim input mode
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -228,7 +224,6 @@ fn test_agent_vim_input() {
         })
         .expect("Failed to open PTY");
 
-    // Build command to spawn via PTY
     let cache_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("llm-cache");
     let sandbox_bin = assert_cmd::cargo::cargo_bin!("sandbox");
     let mut cmd = CommandBuilder::new(&sandbox_bin);
@@ -245,80 +240,43 @@ fn test_agent_vim_input() {
         cache_dir.to_str().unwrap(),
     ]);
 
-    // Spawn the agent process in the PTY
     let mut child = pair
         .slave
         .spawn_command(cmd)
         .expect("Failed to spawn agent in PTY");
-
-    // Drop the slave to avoid blocking on read
     drop(pair.slave);
 
-    // Get a reader from the master side and spawn a thread to collect output
-    let mut reader = pair
-        .master
-        .try_clone_reader()
-        .expect("Failed to get PTY reader");
-    let output_data = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let output_data_clone = output_data.clone();
-
-    let reader_thread = std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    output_data_clone
-                        .lock()
-                        .unwrap()
-                        .extend_from_slice(&buf[..n]);
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    // Wait for the agent to process the message (poll collected output for expected content)
-    let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(120);
-
-    loop {
-        // Check if we got the expected output
-        let data = output_data.lock().unwrap();
-        let output_str = String::from_utf8_lossy(&data);
-        if output_str.contains(secret_content) {
-            break;
-        }
-
-        // Check timeout
-        if start.elapsed() > timeout {
-            let _ = child.kill();
-            panic!("Timeout waiting for agent output.\noutput: {}", output_str);
-        }
-        drop(data);
-
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    // Kill the agent (it's waiting for more vim input)
-    let _ = child.kill();
-    let _ = child.wait();
-    drop(pair.master); // Close the master to unblock the reader thread
-    let _ = reader_thread.join();
-
-    let final_data = output_data.lock().unwrap();
-    let output = String::from_utf8_lossy(&final_data);
-    assert!(
-        output.contains(secret_content),
-        "Agent output should contain the secret content when using vim input.\noutput: {}",
-        output
+    let mut writer = pair.master.take_writer().expect("Failed to get PTY writer");
+    let mut reader = std::io::BufReader::new(
+        pair.master
+            .try_clone_reader()
+            .expect("Failed to get PTY reader"),
     );
 
-    // Verify the user message was recorded in output (shows vim input worked)
+    // Read lines until we see the exit prompt
+    let mut all_output = String::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("Failed to read line");
+        all_output.push_str(&line);
+        if line.contains("Exit? [Y/n]") {
+            break;
+        }
+    }
+
+    writer.write_all(b"Y\n").expect("Failed to write to PTY");
+    child.wait().expect("Agent should exit successfully");
+
     assert!(
-        output.contains("> Run `cat secret.txt` and tell me what it contains."),
+        all_output.contains(secret_content),
+        "Agent output should contain the secret content when using vim input.\noutput: {}",
+        all_output
+    );
+
+    assert!(
+        all_output.contains("> Run `cat secret.txt` and tell me what it contains."),
         "Agent output should show the user message from vim.\noutput: {}",
-        output
+        all_output
     );
 }
 
