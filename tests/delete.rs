@@ -30,8 +30,6 @@ fn test_delete_with_readonly_files_copy_mode() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    std::thread::sleep(std::time::Duration::from_secs(1));
-
     // Try to delete the sandbox - this should succeed even with readonly files
     let output = fixture.run_sandbox(&["delete", &fixture.name]);
     assert!(
@@ -63,8 +61,6 @@ fn test_delete_with_readonly_files_overlayfs_mode() {
         "Failed to create readonly files: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-
-    std::thread::sleep(std::time::Duration::from_secs(1));
 
     // Try to delete the sandbox - this should succeed even with readonly files
     let output = fixture.run_sandbox(&["delete", &fixture.name]);
@@ -119,8 +115,6 @@ fn test_delete_with_repo_relative_overlay_copy_mount() {
         "Failed to enter sandbox: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-
-    std::thread::sleep(std::time::Duration::from_secs(1));
 
     // Try to delete the sandbox - this should succeed even if Docker created
     // a root-owned directory in the clone

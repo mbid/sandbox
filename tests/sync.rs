@@ -3,8 +3,9 @@
 mod common;
 
 use std::fs;
+use std::time::Duration;
 
-use common::{run_git, run_sandbox_in_with_socket, SandboxFixture, TestDaemon, TestRepo};
+use common::{run_git, run_sandbox_in_with_socket, wait_for, SandboxFixture, TestDaemon, TestRepo};
 
 #[test]
 fn test_sync_with_history_rewrite() {
@@ -39,21 +40,15 @@ fn test_sync_with_history_rewrite() {
     assert!(output.status.success());
     let first_commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-    // Wait for sync to propagate to host
-    std::thread::sleep(std::time::Duration::from_secs(3));
-
-    // Verify the commit is synced to host's remote tracking ref
-    let output = run_git(
-        &fixture.repo.dir,
-        &[
-            "rev-parse",
-            &format!("refs/remotes/sandbox/{}", fixture.name),
-        ],
-    );
-    let host_remote_ref = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    assert_eq!(
-        first_commit, host_remote_ref,
-        "First commit should be synced to host"
+    // Wait for sync to propagate to host (poll instead of fixed sleep)
+    let ref_name = format!("refs/remotes/sandbox/{}", fixture.name);
+    let synced = wait_for(Duration::from_secs(5), Duration::from_millis(100), || {
+        let output = run_git(&fixture.repo.dir, &["rev-parse", &ref_name]);
+        String::from_utf8_lossy(&output.stdout).trim() == first_commit
+    });
+    assert!(
+        synced,
+        "First commit should be synced to host within timeout"
     );
 
     // Now amend the commit (rewrite history)
@@ -79,22 +74,16 @@ fn test_sync_with_history_rewrite() {
         "Amended commit should have different hash"
     );
 
-    // Wait for sync to propagate
-    std::thread::sleep(std::time::Duration::from_secs(3));
-
-    // Verify the amended commit is synced to host's remote tracking ref
-    let output = run_git(
-        &fixture.repo.dir,
-        &[
-            "rev-parse",
-            &format!("refs/remotes/sandbox/{}", fixture.name),
-        ],
-    );
-    let host_remote_ref_after = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    assert_eq!(
-        amended_commit, host_remote_ref_after,
-        "Amended commit should be synced to host. Expected {}, got {}",
-        amended_commit, host_remote_ref_after
+    // Wait for amended commit to sync to host (poll instead of fixed sleep)
+    let ref_name = format!("refs/remotes/sandbox/{}", fixture.name);
+    let synced = wait_for(Duration::from_secs(5), Duration::from_millis(100), || {
+        let output = run_git(&fixture.repo.dir, &["rev-parse", &ref_name]);
+        String::from_utf8_lossy(&output.stdout).trim() == amended_commit
+    });
+    assert!(
+        synced,
+        "Amended commit should be synced to host within timeout. Expected {}",
+        amended_commit
     );
 }
 

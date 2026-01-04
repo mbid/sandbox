@@ -191,8 +191,10 @@ pub fn exec_in_container(
 
 /// Stop a running container. Silently succeeds if container is already stopped.
 pub fn stop_container(name: &str) -> Result<()> {
+    // Use -t 0 to skip the graceful shutdown period. Our containers run
+    // `sleep infinity` which ignores SIGTERM anyway, so waiting is pointless.
     let status = Command::new("docker")
-        .args(["stop", name])
+        .args(["stop", "-t", "0", name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()

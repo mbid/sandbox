@@ -9,6 +9,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use indoc::indoc;
 use rand::Rng;
@@ -368,4 +369,20 @@ impl<'a> AgentBuilder<'a> {
 
         child.wait_with_output().expect("Failed to wait for agent")
     }
+}
+
+/// Poll a condition until it returns true or timeout is reached.
+/// Returns true if condition was met, false if timed out.
+pub fn wait_for<F>(timeout: Duration, poll_interval: Duration, mut condition: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if condition() {
+            return true;
+        }
+        std::thread::sleep(poll_interval);
+    }
+    false
 }
