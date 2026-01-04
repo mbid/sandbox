@@ -11,6 +11,7 @@ use crate::git;
 use crate::llm_cache::LlmCache;
 use crate::sandbox;
 use crate::sandbox_config::SandboxConfig;
+use crate::setup;
 
 #[derive(Parser)]
 #[command(name = "sandbox")]
@@ -74,6 +75,12 @@ pub enum Commands {
 
     /// Run the sandbox daemon (manages sandboxes across all projects)
     Daemon,
+
+    /// Install the sandbox daemon as a systemd user service
+    SystemInstall,
+
+    /// Uninstall the sandbox daemon from systemd
+    SystemUninstall,
 }
 
 fn init_logging(_command: &Commands) -> Result<()> {
@@ -88,6 +95,12 @@ pub fn run() -> Result<()> {
     match cli.command {
         Commands::Daemon => {
             daemon::run_daemon()?;
+        }
+        Commands::SystemInstall => {
+            setup::system_install()?;
+        }
+        Commands::SystemUninstall => {
+            setup::system_uninstall()?;
         }
         Commands::Enter {
             name,

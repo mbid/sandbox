@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use indoc::{formatdoc, indoc};
+use listenfd::ListenFd;
 use log::{debug, error, info, warn};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -27,8 +29,10 @@ pub fn socket_path() -> Result<PathBuf> {
         return Ok(PathBuf::from(path));
     }
 
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-        .context("XDG_RUNTIME_DIR not set; cannot determine daemon socket path")?;
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").context(indoc! {"
+        XDG_RUNTIME_DIR not set. This usually means you're not running in a
+        systemd user session. The sandbox daemon requires systemd for socket activation.
+    "})?;
     Ok(PathBuf::from(runtime_dir).join("sandbox.sock"))
 }
 
@@ -62,10 +66,15 @@ pub fn connect(
     };
 
     let stream = UnixStream::connect(&sock_path).with_context(|| {
-        format!(
-            "Failed to connect to daemon at {}. Is the daemon running?",
-            sock_path.display()
-        )
+        formatdoc! {"
+            Failed to connect to daemon at {sock_path}.
+
+            The sandbox daemon is not running. To install it, run:
+
+                sandbox system-install
+
+            This will configure systemd to start the daemon automatically.
+        ", sock_path = sock_path.display()}
     })?;
 
     debug!("Connected to daemon");
@@ -483,19 +492,30 @@ fn handle_ensure_sandbox(
     }
 }
 
-/// Run the daemon, listening for connections on the socket.
-pub fn run_daemon() -> Result<()> {
-    let sock_path = socket_path()?;
+/// Get the listener for the daemon.
+/// Uses systemd socket activation if available, otherwise binds to $SANDBOX_DAEMON_SOCKET.
+fn get_listener() -> Result<UnixListener> {
+    let mut listenfd = ListenFd::from_env();
+    if let Some(listener) = listenfd.take_unix_listener(0).ok().flatten() {
+        info!("Daemon starting with systemd socket activation");
+        return Ok(listener);
+    }
+
+    let sock_path = std::env::var(SOCKET_PATH_ENV).with_context(|| {
+        format!(
+            "{} not set and no systemd socket activation",
+            SOCKET_PATH_ENV
+        )
+    })?;
+    let sock_path = PathBuf::from(sock_path);
 
     info!("Daemon starting, socket: {}", sock_path.display());
 
-    // Create parent directory if needed
     if let Some(parent) = sock_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create socket directory: {}", parent.display()))?;
     }
 
-    // Remove existing socket if present
     if sock_path.exists() {
         std::fs::remove_file(&sock_path).with_context(|| {
             format!("Failed to remove existing socket: {}", sock_path.display())
@@ -505,13 +525,15 @@ pub fn run_daemon() -> Result<()> {
     let listener = UnixListener::bind(&sock_path)
         .with_context(|| format!("Failed to bind socket: {}", sock_path.display()))?;
 
-    info!("Listening on {}", sock_path.display());
+    Ok(listener)
+}
+
+pub fn run_daemon() -> Result<()> {
+    let listener = get_listener()?;
 
     let state = Arc::new(Mutex::new(DaemonState::new()));
     let mut client_id: u64 = 0;
 
-    // The daemon runs forever, accepting connections.
-    // It is expected to be terminated by a signal (e.g. SIGTERM).
     loop {
         match listener.accept() {
             Ok((stream, _)) => {

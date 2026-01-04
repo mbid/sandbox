@@ -10,5 +10,6 @@ pub mod llm_cache;
 pub mod overlay;
 pub mod sandbox;
 pub mod sandbox_config;
+pub mod setup;
 
 pub use cli::run;
